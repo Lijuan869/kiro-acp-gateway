@@ -12,7 +12,8 @@
 FROM python:3.12-slim-trixie
 
 ARG TARGETARCH=amd64
-ARG KIRO_CLI_VERSION=latest
+# Pin the CLI so a rebuild does not silently move to a newer kiro-cli.
+ARG KIRO_CLI_VERSION=3.5.0
 ENV PATH=/opt/kiro-acp-gateway/.venv/bin:/home/kiro/.local/bin:/usr/local/bin:$PATH \
     UV_LINK_MODE=copy \
     KIRO_GATEWAY_HOST=0.0.0.0 \
@@ -28,13 +29,15 @@ RUN set -eux; \
     case "${TARGETARCH}" in amd64) KIRO_ARCH=x86_64 ;; arm64) KIRO_ARCH=aarch64 ;; *) echo "unsupported arch ${TARGETARCH}" >&2; exit 1 ;; esac; \
     curl -fsSL "https://desktop-release.q.us-east-1.amazonaws.com/${KIRO_CLI_VERSION}/kirocli-${KIRO_ARCH}-linux.zip" -o /tmp/kirocli.zip; \
     unzip -q /tmp/kirocli.zip -d /tmp; \
-    Q_INSTALL_GLOBAL=1 Q_SKIP_SETUP=1 /tmp/kirocli/install.sh; \
+    KIRO_CLI_INSTALL_GLOBAL=1 KIRO_CLI_NO_MODIFY_PATH=1 /tmp/kirocli/install.sh; \
     rm -rf /tmp/kirocli /tmp/kirocli.zip; \
     kiro-cli --version
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.9 /uv /usr/local/bin/uv
 
-RUN useradd --create-home --uid 1000 kiro && mkdir -p /workspace && chown kiro:kiro /workspace
+RUN useradd --create-home --uid 1000 kiro \
+    && mkdir -p /workspace /home/kiro/.kiro \
+    && chown -R kiro:kiro /workspace /home/kiro
 WORKDIR /opt/kiro-acp-gateway
 COPY --chown=kiro:kiro pyproject.toml uv.lock README.md ./
 COPY --chown=kiro:kiro src ./src

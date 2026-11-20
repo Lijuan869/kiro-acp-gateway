@@ -1,0 +1,6 @@
+[Unit]
+Description=kiro-gw HTTP health check
+
+[Service]
+Type=oneshot
+ExecStart=%h/kiro-acp-gateway/deploy/healthcheck.sh

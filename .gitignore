@@ -12,6 +12,9 @@ wheels/
 # Local configuration
 .env
 *.swp
+deploy/kiro-gw.env
+deploy/.env
+deploy/backups/
 
 # macOS
 .DS_Store
