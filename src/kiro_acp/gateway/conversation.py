@@ -8,7 +8,10 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 JSON = dict[str, Any]
-Role = Literal["user", "assistant", "tool"]
+# "system": a notice the client inserted mid-conversation (Claude Code's working-directory
+# updates and reminders, OpenAI developer messages). A leading system prompt is not a
+# message; it lives in Conversation.system.
+Role = Literal["user", "assistant", "tool", "system"]
 
 
 @dataclass(slots=True)
@@ -135,10 +138,14 @@ class Conversation:
         return 0
 
     def fingerprint(self, upto: int | None = None) -> str:
-        """Stable hash of system + tools + the first ``upto`` messages (canonical form)."""
+        """Stable hash of the system prompt and the first ``upto`` messages (canonical form).
+
+        The tool list is not part of it: tools are checked separately when a session is
+        reused (and in MCP mode updated in place), so loading a deferred tool mid-way does
+        not make the conversation look new.
+        """
         payload = {
             "system": self.system.strip(),
-            "tools": sorted(canonical_tool(t) for t in self.tools),
             "messages": [
                 canonical_message(m)
                 for m in self.messages[: len(self.messages) if upto is None else upto]
@@ -170,21 +177,15 @@ class Conversation:
         return total
 
 
-def canonical_tool(tool: ToolDef) -> str:
-    return json.dumps(
-        {"n": tool.name, "d": tool.description, "p": tool.parameters, "k": tool.kind},
-        sort_keys=True,
-    )
-
-
 def canonical_message(message: Message) -> JSON:
-    """Canonical, id-free form so a client's echo of our reply hashes identically."""
+    """Canonical, id-free form so a client's echo of our reply hashes identically.
+
+    Tool calls count by name only: clients echo the arguments back normalized (Claude Code
+    adds defaults such as ``"replace_all": false`` to Edit), and the rest of the prefix
+    already pins the conversation down.
+    """
     text = "".join(p.text for p in message.parts if isinstance(p, TextPart)).strip()
-    calls = [
-        {"name": p.name, "arguments": json.dumps(p.arguments, sort_keys=True, ensure_ascii=False)}
-        for p in message.parts
-        if isinstance(p, ToolCallPart)
-    ]
+    calls = [{"name": p.name} for p in message.parts if isinstance(p, ToolCallPart)]
     results = [
         {"content": p.content.strip(), "error": bool(p.is_error)}
         for p in message.parts

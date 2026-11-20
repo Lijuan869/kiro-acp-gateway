@@ -59,8 +59,13 @@ def build_system_text(
     return "\n\n".join(sections)
 
 
-def render_message(message: Message) -> str:
+def render_message(message: Message, *, sanitize: bool = False) -> str:
     """Render one message as a tagged transcript entry (images are attached separately)."""
+    if message.role == "system":
+        body = message.text().strip()
+        if sanitize:
+            body, _removed = sanitize_system(body)
+        return f'<message role="system">\n{body.strip() or "(empty)"}\n</message>'
     if message.role == "assistant":
         chunks: list[str] = []
         text = message.text().strip()
@@ -126,7 +131,7 @@ def render_prompt(
                 blocks.append(image_block(image.data_base64, image.mime_type))
             else:
                 omitted += 1
-        rendered.append(render_message(message))
+        rendered.append(render_message(message, sanitize=sanitize))
     if omitted:
         rendered.append(
             f"<note>{omitted} image(s) omitted: this agent does not accept image input.</note>"

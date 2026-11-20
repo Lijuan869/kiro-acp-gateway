@@ -724,6 +724,24 @@ the new messages to that session. Otherwise it starts a fresh session and replay
 history as a transcript. `KIRO_GATEWAY_SESSION_MODE=stateless` always starts fresh.
 Responses expose `kiro.session_id`, `kiro.reused_session`, `kiro.agent`, and `kiro.model`.
 
+A missed match is expensive in a long coding session: a new `kiro-cli` process, and the
+model rereads the whole history. Three things coding clients do are therefore tolerated:
+
+- **System messages in the middle of the conversation.** Claude Code inserts
+  `role: "system"` notices (working-directory updates, reminders) into `messages`, and
+  OpenAI clients may send `system`/`developer` messages mid-way. Only those before the first
+  user or assistant message form the system prompt; later ones stay where they were sent
+  and reach Kiro as `<message role="system">` entries (in a tool loop, appended to the last
+  tool result as `[System notice]`).
+- **Tool inputs echoed back with changes.** The fingerprint counts an assistant's tool
+  calls by name, not arguments, because clients fill in defaults when they echo a reply
+  (Claude Code adds `"replace_all": false` to Edit).
+- **Tools loaded mid-conversation.** In MCP tool mode a session whose client tool set
+  changed (Claude Code's deferred tools, loaded through ToolSearch) keeps going: the bridge
+  sends `notifications/tools/list_changed` and Kiro re-reads the list, also while a call is
+  pending. In `emulate` mode the tool schemas are part of the session's first prompt, so a
+  changed set still starts a new session.
+
 **Tool choice.** `tool_choice` is honoured in both tool modes: `none` hides the tools,
 a named function (OpenAI `{"type": "function", ...}`, Anthropic `{"type": "tool", ...}`)
 and `allowed_tools` restrict what Kiro is offered (the session pool keys on the exposed
@@ -753,6 +771,17 @@ It works with Sonnet/Opus-class models but depends on the model following instru
 `reject` refuses requests with tools; `ignore` drops them and runs agent mode.
 Anthropic-defined tools (`bash`, `text_editor`) get synthesized schemas in both modes;
 server-side tools such as `web_search` are ignored.
+
+**Claude Code's WebSearch and WebFetch.** Claude Code runs WebSearch as a separate request
+whose only tool is Anthropic's server-side `web_search`. The gateway ignores that tool, so
+the request runs in agent mode and Kiro searches with its own `web_search` tool. With
+`KIRO_GATEWAY_PERMISSIONS=deny` that call is refused unless a rule allows it:
+`KIRO_GATEWAY_PERMISSION_RULES=allow:title=remote/web_search` (Kiro reports the tool as kind
+`other`, so `kind=search` does not match it). WebFetch downloads the page on the client and
+only sends the text to the model, but Claude Code first asks claude.ai whether the domain
+is safe; where claude.ai is blocked, every fetch fails with "Unable to verify if domain …
+is safe to fetch" until `"skipWebFetchPreflight": true` is set in the client's Claude Code
+`settings.json`.
 
 Open turns waiting for tool results are pooled like any session and cancelled when the
 client abandons them (`KIRO_GATEWAY_SESSION_IDLE_TTL`) or the gateway shuts down.

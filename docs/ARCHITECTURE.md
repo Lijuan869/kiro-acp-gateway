@@ -62,9 +62,12 @@ modes. See `KIRO_ACP_NOTES.md` for the observed wire behaviour.
    tool choice, JSON-output request, effort).
 2. `KiroBackend.resolve_model` maps the requested model to a Kiro model id.
 3. `KiroBackend.run` acquires a session:
-   - **affinity**: hash the conversation prefix up to and including the last assistant
-     message; if a pooled session finished its last turn with that fingerprint (and the
-     same model, agent, permissions, effort), reuse it and send only the new messages.
+   - **affinity**: hash the system prompt and the conversation up to and including the last
+     assistant message; if a pooled session finished its last turn with that fingerprint
+     (and the same model, agent, permissions, effort), reuse it and send only the new
+     messages. Mid-conversation `system`/`developer` messages are ordinary messages in that
+     hash; tool calls count by name only; the tool list is checked separately, and an MCP
+     session takes a changed list in place (`BridgeSession.update_tools`).
    - otherwise spawn `kiro-cli acp`, create a session, and render the whole conversation
      as a transcript preceded by the system text (and the tool protocol when emulating).
 4. Kiro's `TurnEvent`s become `OutputText`, `OutputThought`, `OutputToolCall`, and
@@ -76,7 +79,9 @@ modes. See `KIRO_ACP_NOTES.md` for the observed wire behaviour.
 6. The adapter encodes output events as JSON or SSE in its protocol's shape.
 
 If the HTTP client disconnects mid-stream, the generator is closed, `session/cancel` is
-sent, and the session is discarded (its state would be ambiguous).
+sent, and the session is discarded (its state would be ambiguous). Starlette keeps
+cancelling the response task at every `await`, so that cleanup runs as its own task
+(`KiroBackend._finish`); otherwise it stopped half-way and left `kiro-cli` running.
 
 Concurrency is bounded by a semaphore (`max_concurrency`); the pool is bounded by
 `max_sessions` with LRU eviction and an idle reaper.

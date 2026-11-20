@@ -22,8 +22,11 @@ def decode(line: bytes) -> JSON:
 # bridge -> broker
 HELLO = "hello"  # {"type": "hello", "token": str}
 TOOL_CALL = "tool_call"  # {"type": "tool_call", "call_id": str, "name": str, "arguments": dict}
+TOOLS_LISTED = "tools_listed"  # {"type": "tools_listed", "version": int}: Kiro read that list
 # broker -> bridge
-TOOLS = "tools"  # {"type": "tools", "tools": [{"name", "description", "inputSchema"}]}
+TOOLS = (
+    "tools"  # {"type": "tools", "tools": [{"name", "description", "inputSchema"}], "version": int}
+)
 TOOL_RESULT = (
     "tool_result"  # {"type": "tool_result", "call_id": str, "content": str, "is_error": bool}
 )

@@ -328,7 +328,8 @@ message into a running turn, confirmed by a `steering_consumed` update. Could ba
 
 ### Already covered here (confirmed by the review)
 Embedded `role: "system"` messages inside Anthropic `messages` (Claude Code 2.1.215+) are
-lifted into the system prompt; `GET /v1/models/{id}` is permissive for clients that probe
+kept in place as conversation messages (before 0.1.3 they were lifted into the system
+prompt, which changed the session fingerprint on every notice); `GET /v1/models/{id}` is permissive for clients that probe
 it; `previous_response_id` and `store` are implemented rather than rejected; the SSE
 keepalive on `/v1/responses` is a comment line, never an invented event type; sessions are
 deleted rather than abandoned; per-request effort works on v2 via `/effort`.

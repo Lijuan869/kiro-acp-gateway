@@ -94,9 +94,15 @@ def parse_input(conversation: Conversation, value: Any) -> list[ToolDef]:
             content = item.get("content")
             if role in ("system", "developer"):
                 text = text_of_content(content)
-                conversation.system = (
-                    (conversation.system + "\n\n" + text).strip() if conversation.system else text
-                )
+                if conversation.messages:  # mid-conversation: keep it in place
+                    if text.strip():
+                        conversation.messages.append(Message("system", [TextPart(text)]))
+                else:
+                    conversation.system = (
+                        (conversation.system + "\n\n" + text).strip()
+                        if conversation.system
+                        else text
+                    )
             elif role == "user":
                 conversation.messages.append(Message("user", message_parts(content)))
             elif role == "assistant":

@@ -35,7 +35,9 @@ class BridgeServer:
         self.socket_path = socket_path
         self.token = token
         self.tools: list[JSON] = []
+        self.tools_version = 0
         self.tools_ready = asyncio.Event()
+        self.initialized = False  # Kiro finished the MCP handshake; notifications may flow
         self.pending: dict[str, asyncio.Future[JSON]] = {}
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
@@ -65,7 +67,12 @@ class BridgeServer:
                 kind = message.get("type")
                 if kind == protocol.TOOLS:
                     self.tools = list(message.get("tools") or [])
+                    self.tools_version = int(message.get("version") or 1)
+                    first = not self.tools_ready.is_set()
                     self.tools_ready.set()
+                    if not first and self.initialized:
+                        # The client's tool set grew mid-conversation; Kiro re-lists.
+                        await self._notify("notifications/tools/list_changed")
                 elif kind == protocol.TOOL_RESULT:
                     future = self.pending.pop(str(message.get("call_id")), None)
                     if future is not None and not future.done():
@@ -121,18 +128,26 @@ class BridgeServer:
         self.stdout.write(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
         await self.stdout.drain()
 
+    async def _notify(self, method: str) -> None:
+        if self.stdout is None:
+            return
+        self.stdout.write(json.dumps({"jsonrpc": "2.0", "method": method}).encode("utf-8") + b"\n")
+        await self.stdout.drain()
+
     async def _handle(self, message: JSON) -> None:
         method = message.get("method")
         request_id = message.get("id")
         params = message.get("params") or {}
         if request_id is None:  # notification
+            if method == "notifications/initialized":
+                self.initialized = True
             return
         if method == "initialize":
             await self._reply(
                 request_id,
                 {
                     "protocolVersion": params.get("protocolVersion") or PROTOCOL_VERSION,
-                    "capabilities": {"tools": {"listChanged": False}},
+                    "capabilities": {"tools": {"listChanged": True}},
                     "serverInfo": {"name": "kiro-gateway-harness", "version": "1"},
                 },
             )
@@ -140,7 +155,10 @@ class BridgeServer:
             await self._reply(request_id, {})
         elif method == "tools/list":
             await asyncio.wait_for(self.tools_ready.wait(), 30)
+            version = self.tools_version
             await self._reply(request_id, {"tools": self.tools})
+            if not self.closed:
+                await self.send_broker({"type": protocol.TOOLS_LISTED, "version": version})
         elif method == "tools/call":
             await self._tools_call(request_id, params)
         else:

@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 import weakref
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -287,6 +287,7 @@ class KiroBackend:
         # Every agent this backend launched, to count live kiro-cli processes at scrape time.
         self._agents: weakref.WeakSet[KiroAgent] = weakref.WeakSet()
         self._waiting = 0  # requests waiting for a turn slot
+        self._cleanups: set[asyncio.Task[None]] = set()
         self.loop_monitor = LoopLagMonitor(self.metrics.observe_loop_lag)
 
     # ------------------------------------------------------------------ lifecycle
@@ -353,6 +354,9 @@ class KiroBackend:
             for pooled in list(self._active):
                 await pooled.close(delete=self.settings.delete_sessions)
             self._active.clear()
+        if self._cleanups:
+            # Sessions of requests that went away are still being closed.
+            await asyncio.wait(set(self._cleanups), timeout=self.settings.shutdown_grace)
         if self._warmup is not None and not self._warmup.done():
             self._warmup.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -682,7 +686,7 @@ class KiroBackend:
             permissions=permissions,
             workspace=self.workspace_for(opts),
             bridge=bridge,
-            tools_signature=tools_signature(tools) if use_bridge else "",
+            tools_signature=tools_signature(tools) if tools else "",
             mcp_signature=mcp_signature(opts.mcp_servers),
         )
 
@@ -696,15 +700,16 @@ class KiroBackend:
         tools: list[ToolDef] | None = None,
     ) -> tuple[PooledSession, int, bool]:
         """Return ``(pooled, start_index, fresh)``. ``tools`` are the ones the model may see
-        (after ``tool_choice`` restrictions); the pool keys on that set."""
+        (after ``tool_choice`` restrictions).
+
+        A session bridged over MCP takes a changed tool set in place (Claude Code loads
+        deferred tools mid-conversation): the bridge announces the new list and Kiro re-reads
+        it, even while a call is pending. An emulated-tools session needs the same set,
+        because its tool schemas are part of the prompt it was started with.
+        """
         if tools is None:
             tools = conversation.tools
-        signature = (
-            tools_signature(tools)
-            if opts.emulate_tools and self.settings.tool_mode == "mcp"
-            else ""
-        )
-        """Return ``(pooled, start_index, fresh)``."""
+        signature = tools_signature(tools) if opts.emulate_tools else ""
         if self.settings.session_mode == "affinity":
             start = conversation.prefix_length_for_affinity()
             if start > 0:
@@ -722,20 +727,49 @@ class KiroBackend:
                         and pooled.permissions == permissions
                         and pooled.agent.engine == self.engine_for(opts)
                         and pooled.workspace == self.workspace_for(opts)
-                        and pooled.tools_signature == signature
+                        and (pooled.tools_signature == signature or pooled.bridge is not None)
                         and pooled.mcp_signature == mcp_signature(opts.mcp_servers)
                         and (opts.effort is None or pooled.effort == opts.effort)
                         and pooled.agent.client.is_running
                     ):
                         pooled.busy = True
                         del self._pool[key]
-                        LOG.debug(
-                            "Reusing session %s for prefix %s", pooled.session.session_id, key[:12]
-                        )
-                        return pooled, start, False
+                    else:
+                        pooled = None
+                if pooled is not None and await self._sync_tools(pooled, tools, signature):
+                    LOG.debug(
+                        "Reusing session %s for prefix %s", pooled.session.session_id, key[:12]
+                    )
+                    return pooled, start, False
         pooled = await self._spawn(opts, permissions, tools if signature else None)
         pooled.busy = True
         return pooled, 0, True
+
+    async def _sync_tools(
+        self, pooled: PooledSession, tools: list[ToolDef], signature: str
+    ) -> bool:
+        """Bring a reused MCP session's tool list up to date; False (session closed) if Kiro
+        did not take the new list, so the caller starts a fresh session instead."""
+        if pooled.tools_signature == signature:
+            return True
+        assert pooled.bridge is not None
+        before = {t.get("name") for t in pooled.bridge.tools}
+        after = [mcp_tool(t) for t in tools]
+        if await pooled.bridge.update_tools(after):
+            LOG.info(
+                "Session %s tools updated in place: +%s -%s",
+                pooled.session.session_id,
+                ",".join(sorted({t["name"] for t in after} - before)) or "none",
+                ",".join(sorted(before - {t["name"] for t in after})) or "none",
+            )
+            pooled.tools_signature = signature
+            return True
+        LOG.warning(
+            "Session %s did not re-read its tool list; starting a fresh session",
+            pooled.session.session_id,
+        )
+        await self._release(pooled, None, keep=False)
+        return False
 
     async def _release(self, pooled: PooledSession, fingerprint: str | None, *, keep: bool) -> None:
         pooled.busy = False
@@ -1081,23 +1115,23 @@ class KiroBackend:
             finally:
                 if not recorded:
                     self._record_turn(opts, pooled, outcome, kiro_meta, fresh, failure_text)
+                self._active.discard(pooled)
                 if not completed:
                     LOG.info(
                         "Turn %s ended early; cancelling Kiro session %s",
                         opts.request_id,
                         session.session_id,
                     )
-                    with contextlib.suppress(Exception):
-                        await session.cancel()
-                    await self._release(pooled, None, keep=False)
+                    await self._finish(self._abandon(pooled))
                 elif limiter.hit:
                     # Kiro's history holds the untruncated reply; do not reuse this session.
-                    await self._release(pooled, None, keep=False)
+                    await self._finish(self._release(pooled, None, keep=False))
                 else:
-                    await self._release(
-                        pooled, fingerprint if error is None else None, keep=error is None
+                    await self._finish(
+                        self._release(
+                            pooled, fingerprint if error is None else None, keep=error is None
+                        )
                     )
-                self._active.discard(pooled)
         finally:
             self._turn_slots.release()
 
@@ -1153,17 +1187,24 @@ class KiroBackend:
             # Continuation: hand the client's tool results to the blocked MCP calls.
             results = [r for m in new_messages for r in m.tool_results]
             # Text the client sent along with the results: a plain user message, or text
-            # blocks beside Anthropic tool_result blocks (which land in a tool-role message).
+            # blocks beside Anthropic tool_result blocks (which land in a tool-role message),
+            # plus notices it inserted (Claude Code's working-directory updates, reminders).
             extra_text = "\n\n".join(
                 m.text().strip()
                 for m in new_messages
                 if m.role in ("user", "tool") and m.text().strip()
             )
+            notices = "\n\n".join(
+                m.text().strip() for m in new_messages if m.role == "system" and m.text().strip()
+            )
             delivered = 0
             for result in results:
                 content = result.content
-                if extra_text and result is results[-1]:
-                    content += f"\n\n[User message]: {extra_text}"
+                if result is results[-1]:
+                    if extra_text:
+                        content += f"\n\n[User message]: {extra_text}"
+                    if notices:
+                        content += f"\n\n[System notice]: {notices}"
                 images = [
                     {"data": img.data_base64, "mimeType": img.mime_type} for img in result.images
                 ]
@@ -1337,14 +1378,38 @@ class KiroBackend:
         finally:
             if not recorded:
                 self._record_turn(opts, pooled, outcome, kiro_meta, fresh, failure_text)
-            if pooled.pending is not None and not keep:
-                await pooled.pending.cancel("request ended")
-                pooled.pending = None
-            if not completed and not keep:
-                await self._release(pooled, None, keep=False)
-            else:
-                await self._release(pooled, fingerprint if keep else None, keep=keep)
             self._active.discard(pooled)
+            await self._finish(self._settle_mcp(pooled, keep, completed, fingerprint))
+
+    async def _settle_mcp(
+        self, pooled: PooledSession, keep: bool, completed: bool, fingerprint: str | None
+    ) -> None:
+        if pooled.pending is not None and not keep:
+            await pooled.pending.cancel("request ended")
+            pooled.pending = None
+        if not completed and not keep:
+            await self._release(pooled, None, keep=False)
+        else:
+            await self._release(pooled, fingerprint if keep else None, keep=keep)
+
+    async def _abandon(self, pooled: PooledSession) -> None:
+        """Cancel the Kiro turn of a request that went away and close its session."""
+        with contextlib.suppress(Exception):
+            await pooled.session.cancel()
+        await self._release(pooled, None, keep=False)
+
+    async def _finish(self, cleanup: Coroutine[Any, Any, None]) -> None:
+        """Run end-of-turn cleanup so that cancelling the request cannot interrupt it.
+
+        When a client disconnects mid-stream, Starlette cancels the response task and keeps
+        cancelling it at every ``await``, so cleanup awaited directly in a ``finally`` used to
+        stop half-way and leave the kiro-cli process running. The cleanup runs as its own
+        task; the request waits for it unless it is being cancelled.
+        """
+        task = asyncio.ensure_future(cleanup)
+        self._cleanups.add(task)
+        task.add_done_callback(self._cleanups.discard)
+        await asyncio.shield(task)
 
     async def _retry_json(
         self, session: Session, text: str, errors: list[str], conversation: Conversation

@@ -30,6 +30,9 @@ class BridgeSession:
     connected: asyncio.Event = field(default_factory=asyncio.Event)
     listener: ToolCallListener | None = None
     pending_calls: dict[str, tuple[str, JSON]] = field(default_factory=dict)
+    version: int = 1  # of ``tools``; the bridge reports which version Kiro last listed
+    listed_version: int = 0
+    _listed: asyncio.Condition = field(default_factory=asyncio.Condition, init=False, repr=False)
 
     async def send(self, message: JSON) -> None:
         if self.writer is None or self.writer.is_closing():
@@ -37,6 +40,34 @@ class BridgeSession:
         self.writer.write(protocol.encode(message))
         with contextlib.suppress(ConnectionError, OSError):
             await self.writer.drain()
+
+    async def update_tools(self, tools: list[JSON], *, timeout: float = 5.0) -> bool:
+        """Replace the tool list of a live session and wait until Kiro has re-read it.
+
+        The bridge sends ``notifications/tools/list_changed``; Kiro (v2 and v3) answers
+        with ``tools/list`` even while a call is pending, so a tool the client loaded
+        mid-turn (Claude Code's deferred tools) is callable when the turn continues.
+        Returns False if Kiro did not re-list in time.
+        """
+        self.tools = tools
+        self.version += 1
+        version = self.version
+        if self.writer is None or self.writer.is_closing():
+            return False
+        await self.send({"type": protocol.TOOLS, "tools": tools, "version": version})
+        async with self._listed:
+            try:
+                await asyncio.wait_for(
+                    self._listed.wait_for(lambda: self.listed_version >= version), timeout
+                )
+            except TimeoutError:
+                return False
+        return True
+
+    async def mark_listed(self, version: int) -> None:
+        async with self._listed:
+            self.listed_version = max(self.listed_version, version)
+            self._listed.notify_all()
 
     async def deliver_result(
         self,
@@ -140,10 +171,15 @@ class ToolBridgeBroker:
                 writer.close()
                 return
             session.writer = writer
-            await session.send({"type": protocol.TOOLS, "tools": session.tools})
+            await session.send(
+                {"type": protocol.TOOLS, "tools": session.tools, "version": session.version}
+            )
             session.connected.set()
             while line := await reader.readline():
                 message = protocol.decode(line)
+                if message.get("type") == protocol.TOOLS_LISTED:
+                    await session.mark_listed(int(message.get("version") or 0))
+                    continue
                 if message.get("type") == protocol.TOOL_CALL:
                     call_id = str(message.get("call_id"))
                     name = str(message.get("name", ""))

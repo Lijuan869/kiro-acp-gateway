@@ -4,7 +4,35 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.3] - 2026-11-21
+
+### Fixed (session reuse with Claude Code)
+
+Found by running Claude Code 2.1.329 against a live gateway (`scripts/e2e_claude_code.py`):
+in a tool loop most requests started a new `kiro-cli` and replayed the whole conversation.
+
+- `role: "system"` messages in the middle of `messages` (Claude Code's working-directory
+  updates and reminders, OpenAI `system`/`developer` messages) stay in place instead of
+  being merged into the system prompt, which changed the session fingerprint on every
+  notice. Kiro receives them as `<message role="system">`, or appended to the last tool
+  result as `[System notice]` when a tool loop continues.
+- The fingerprint counts tool calls by name only: Claude Code echoes Edit calls back with
+  `"replace_all": false` added, so every step after an Edit used to miss.
+- In MCP tool mode a session whose tool list changed (deferred tools loaded through
+  ToolSearch) is updated in place: the bridge sends `notifications/tools/list_changed` and
+  Kiro re-reads the list, also while a call is pending (verified on kiro-cli 3.5.0, v2 and
+  v3 engines). Emulated-tools sessions still need an identical tool set.
+- A client disconnecting mid-stream no longer leaves `kiro-cli` running and the turn
+  listed as active: the cleanup is no longer cancelled half-way.
+- Agent exit errors carry the exit status (`exit status: None` when stdout closed before
+  the process was reaped; this also failed a test on Python 3.11).
+
+### Added (tests)
+
+- `scripts/e2e_claude_code.py`: runs real Claude Code through the gateway (sequential and
+  parallel tool calls, Edit, a subagent, WebSearch, WebFetch, and the AskUserQuestion option
+  picker driven in a pseudo-terminal), checks the outcomes, and reports how many Kiro
+  sessions each scenario used.
 
 Monitoring and logging, with no new dependencies. See the README sections "Metrics" and
 "Logging" for the series, the formats, and the measured cost.

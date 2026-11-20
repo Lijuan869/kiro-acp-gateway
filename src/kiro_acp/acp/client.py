@@ -349,10 +349,22 @@ class ACPClient:
                     self.recorder.record("in", raw)
                 self._route(jsonrpc.parse(raw))
         finally:
-            error = self._process_error("agent stdout closed")
-            self._exit_error = error
-            self._fail_pending(error)
-            await self._broadcast_all("_client/agent_exited", {"error": str(error)})
+            try:
+                await self._await_exit(1.0)
+            finally:
+                error = self._process_error("agent stdout closed")
+                self._exit_error = error
+                self._fail_pending(error)
+                await self._broadcast_all("_client/agent_exited", {"error": str(error)})
+
+    async def _await_exit(self, timeout: float) -> None:
+        """Give an agent whose stdout closed a moment to be reaped, so errors carry its exit
+        status (EOF usually arrives before the exit is reported)."""
+        process = self.process
+        if process is None or process.returncode is not None:
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(process.wait()), timeout)
 
     async def _read_stderr(self) -> None:
         assert self.process is not None and self.process.stderr is not None

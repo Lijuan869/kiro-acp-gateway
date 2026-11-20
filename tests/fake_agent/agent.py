@@ -646,6 +646,17 @@ class McpClient:
                 "clientInfo": {"name": "fake", "version": "0"},
             },
         )
+        await self.notify("notifications/initialized")
+        result = await self.request("tools/list", {})
+        self.tools = result.get("tools", [])
+
+    async def notify(self, method: str) -> None:
+        assert self.process and self.process.stdin
+        self.process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": method}).encode() + b"\n")
+        await self.process.stdin.drain()
+
+    async def _relist(self) -> None:
+        # Like Kiro: re-read the tool list when the server says it changed, even mid-call.
         result = await self.request("tools/list", {})
         self.tools = result.get("tools", [])
 
@@ -655,6 +666,9 @@ class McpClient:
             try:
                 message = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if message.get("method") == "notifications/tools/list_changed":
+                asyncio.create_task(self._relist())
                 continue
             future = self.pending.pop(message.get("id"), None)
             if future is not None and not future.done():

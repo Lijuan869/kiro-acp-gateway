@@ -157,7 +157,14 @@ def build_conversation(body: JSON) -> Conversation:
                     # thinking / redacted_thinking / server tool blocks are dropped.
             conversation.messages.append(Message("assistant", parts))
         elif role == "system":
-            conversation.system = (conversation.system + "\n\n" + system_text(content)).strip()
+            # Before any message this is a system prompt. Later ones are notices Claude Code
+            # inserts mid-conversation (working-directory changes, reminders): they stay in
+            # place, so the history Kiro already has keeps the same fingerprint.
+            text = system_text(content)
+            if not conversation.messages:
+                conversation.system = (conversation.system + "\n\n" + text).strip()
+            elif text.strip():
+                conversation.messages.append(Message("system", [TextPart(text)]))
         else:
             raise GatewayError(f"Unsupported message role {role!r}", code="invalid_role")
     conversation.tools = parse_tools(body.get("tools") or [])

@@ -58,7 +58,11 @@ def build_conversation(body: JSON) -> Conversation:
         role = raw.get("role")
         content = raw.get("content")
         if role in ("system", "developer"):
-            system_parts.append(text_of_content(content))
+            text = text_of_content(content)
+            if not conversation.messages:
+                system_parts.append(text)
+            elif text.strip():  # mid-conversation instructions stay where they were sent
+                conversation.messages.append(Message("system", [TextPart(text)]))
         elif role == "user":
             conversation.messages.append(Message("user", user_parts(content), name=raw.get("name")))
         elif role == "assistant":
