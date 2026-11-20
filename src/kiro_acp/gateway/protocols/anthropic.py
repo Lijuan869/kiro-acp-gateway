@@ -31,6 +31,7 @@ from kiro_acp.gateway.protocols.common import (
     int_or_none,
     new_id,
     read_json,
+    record_stream_error,
     sse,
     sse_response,
     stop_list,
@@ -490,6 +491,7 @@ async def stream_messages(
                         if open_block is not None:
                             yield stop_block()
                         if finish == "error":
+                            record_stream_error(backend, error or "Kiro turn failed")
                             yield sse(
                                 {
                                     "type": "error",
@@ -522,6 +524,7 @@ async def stream_messages(
                         )
                         yield sse({"type": "message_stop"}, "message_stop")
     except GatewayError as gw_error:
+        record_stream_error(backend, gw_error)
         yield sse(
             {"type": "error", "error": {"type": gw_error.error_type, "message": gw_error.message}},
             "error",

@@ -12,6 +12,7 @@ import uvicorn
 from kiro_acp import __version__
 from kiro_acp.gateway.app import create_app
 from kiro_acp.gateway.config import Settings
+from kiro_acp.gateway.logs import configure_logging
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,6 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="max simultaneous Kiro turns (env KIRO_GATEWAY_MAX_CONCURRENCY)",
     )
     parser.add_argument("--log-level", help="uvicorn log level (env KIRO_GATEWAY_LOG_LEVEL)")
+    parser.add_argument(
+        "--log-format",
+        choices=("text", "json"),
+        help="log line format on stderr (env KIRO_GATEWAY_LOG_FORMAT)",
+    )
     parser.add_argument("--debug-acp", action="store_true", help="log raw ACP traffic")
     parser.add_argument(
         "--print-config", action="store_true", help="print the effective configuration and exit"
@@ -150,6 +156,7 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
             "session_mode": args.session_mode,
             "max_concurrency": args.max_concurrency,
             "log_level": args.log_level,
+            "log_format": args.log_format,
             "debug_acp": True if args.debug_acp else None,
         }.items()
         if value is not None
@@ -195,14 +202,23 @@ def main(argv: list[str] | None = None) -> int:
                 "and KIRO_API_KEY in particular breaks Kiro's own authentication.",
                 file=sys.stderr,
             )
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    stop_logging = configure_logging(settings.log_level, settings.log_format)
     if settings.debug_acp:
         logging.getLogger("kiro_acp.acp.wire").setLevel(logging.DEBUG)
-    app = create_app(settings)
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level=settings.log_level.lower())
+    try:
+        app = create_app(settings)
+        # log_config=None: uvicorn's own loggers propagate to the gateway handler (one format,
+        # one non-blocking writer); its access log is replaced by kiro_acp.gateway.access.
+        uvicorn.run(
+            app,
+            host=settings.host,
+            port=settings.port,
+            log_level=settings.log_level.lower(),
+            log_config=None,
+            access_log=False,
+        )
+    finally:
+        stop_logging()  # write out whatever is still queued
     return 0
 
 

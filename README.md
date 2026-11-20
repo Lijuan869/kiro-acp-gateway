@@ -916,6 +916,8 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_SERVE_FS` / `SERVE_TERMINAL` | `false` | Offer client file-system / terminal capabilities to Kiro. |
 | `KIRO_GATEWAY_DEBUG_ACP` | `false` | Log raw ACP traffic. |
 | `KIRO_GATEWAY_LOG_LEVEL` | `info` | Log level. |
+| `KIRO_GATEWAY_LOG_FORMAT` | `text` | `text`, or `json` (one object per line) for log shippers such as Loki, Elasticsearch, or CloudWatch. Also `--log-format`. |
+| `KIRO_GATEWAY_ACCESS_LOG` | `true` | One line per HTTP request with status, duration, bytes, and request id. `/health`, `/metrics`, and `/v1/kiro/stats` are logged at `debug` unless they fail. |
 
 ### Troubleshooting
 
@@ -1017,7 +1019,9 @@ treat them as sensitive.
 
 **Dashboard.** `http://127.0.0.1:8000/dashboard` is a single self-contained page (no
 external assets, works offline) showing what the gateway is doing right now: health,
-active turns and free slots, live sessions with model, agent, workspace and idle time,
+active turns and free slots, the gateway process (uptime, memory, CPU time, open files,
+event-loop lag, running `kiro-cli` processes, queued requests), HTTP requests by route and
+status, live sessions with model, agent, workspace and idle time,
 turns by mode/model/finish reason, latency histograms, credits per model, errors, and the
 recent sessions from the audit ledger; clicking one opens its records in a side panel. It refreshes every few
 seconds; a header button switches between the light (default) and dark themes and the
@@ -1028,10 +1032,69 @@ too). `KIRO_GATEWAY_DASHBOARD=false` removes the page. The numbers live in memor
 reset when the gateway restarts; for history use Prometheus.
 
 **Metrics.** `GET /metrics` (same key as `/v1`) serves Prometheus text:
-`kiro_gateway_turns_total{mode,engine,model,finish}`, `kiro_gateway_turn_seconds`
-(histogram), `kiro_gateway_credits_total{model}`, `kiro_gateway_session_reuse_total`,
-`kiro_gateway_errors_total{code,status}`, and gauges for active turns, live sessions, and
-cached models. `GET /health` stays unauthenticated for liveness probes.
+
+| Metric | What it tells you |
+|---|---|
+| `kiro_gateway_turns_total{mode,engine,model,finish}` | Turns by outcome. `finish="aborted"` is a turn whose client went away before the reply (or a shutdown); `error` includes turns that failed with an exception. |
+| `kiro_gateway_turn_seconds` (histogram) | Turn latency, including the queue wait and any kiro-cli start. |
+| `kiro_gateway_queue_wait_seconds` (histogram), `kiro_gateway_queued_requests`, `kiro_gateway_turn_slots_free`, `kiro_gateway_max_concurrency` | Saturation: time spent waiting for a turn slot and how many requests are waiting. |
+| `kiro_gateway_session_spawn_seconds{engine}` (histogram) | Time to start `kiro-cli` and create a session; the cold-start cost that session reuse avoids. |
+| `kiro_gateway_session_reuse_total`, `kiro_gateway_credits_total{model}` | Session reuse and Kiro credits. |
+| `kiro_gateway_errors_total{code,status}` | Errors returned to clients, including errors sent inside SSE streams (counted with the status the error maps to; the HTTP status of a stream is already 200). |
+| `kiro_gateway_http_requests_total{method,route,status}`, `kiro_gateway_http_request_duration_seconds{method,route}`, `kiro_gateway_http_requests_in_flight` | HTTP traffic. `route` is the route template (`/v1/kiro/sessions/{session_id}/audit`), `<unmatched>` for unknown paths, and unknown methods count as `OTHER`, so clients cannot add label values. Stream durations run to the last byte. |
+| `kiro_gateway_event_loop_lag_seconds` (histogram) | How late the event loop ran a once-a-second timer. Every request waits this long, so sustained values above a few milliseconds mean something is blocking the loop. |
+| `kiro_gateway_agent_processes`, `kiro_gateway_active_turns`, `kiro_gateway_live_sessions`, `kiro_gateway_models_cached` | Running `kiro-cli` processes the gateway started (more than active turns plus live sessions points at a leak), turns running, idle sessions kept for reuse, cached models. |
+| `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds`, `process_max_fds`, `process_start_time_seconds` | The gateway process itself (standard names; resident memory needs Linux `/proc`). `kiro-cli` children are not included: use `docker stats` or cAdvisor for the container total. |
+| `kiro_gateway_build_info{version,python}`, `kiro_gateway_log_records_dropped_total` | Version, and log lines lost to a full log queue (see Logging). |
+
+`GET /health` stays unauthenticated for liveness probes. A scrape job:
+
+```yaml
+scrape_configs:
+  - job_name: kiro-gateway
+    authorization: {credentials: "<KIRO_GATEWAY_API_KEY>"}
+    static_configs: [{targets: ["127.0.0.1:8000"]}]
+```
+
+**Logging.** Every line names the request it belongs to:
+
+```text
+2026-11-20 23:23:05,081 INFO kiro_acp.gateway.backend [req_5e0c…]: Started kiro-cli pid=17761 engine=v3 session=… in 3.12s
+2026-11-20 23:23:05,081 INFO kiro_acp.gateway.backend [req_5e0c…]: turn req_5e0c…: agent engine=v3 … session=…
+2026-11-20 23:23:17,402 INFO kiro_acp.gateway.backend [req_5e0c…]: turn req_5e0c… finished: stop in 15.43s model=claude-sonnet-4.6 credits=0.1200 session=…
+2026-11-20 23:23:17,403 INFO kiro_acp.gateway.access [req_5e0c…]: POST /v1/messages 200 15.441s in=153201B out=48213B client=127.0.0.1 ua="claude-cli/2.1.0"
+```
+
+The id is the client's `X-Request-ID` header when it is a plain token (letters, digits,
+`._:/=+@-`, at most 128 characters), otherwise a generated `req_…`; every response
+carries it back in `X-Request-ID`, so a client can quote it. Lines with `[-]` belong to no
+request (startup, the idle reaper, `kiro-cli` stderr). The access line is written when the
+response ends, so for a stream it covers the whole stream; `incomplete` means the body
+was cut short, normally because the client disconnected, and `failed=<Exception>` that the
+handler raised. Client-supplied values are escaped, so a path or user agent cannot forge a
+line. Uvicorn's own lines use the same format, and uvicorn's access log is replaced by
+this one. `KIRO_GATEWAY_LOG_FORMAT=json` writes the same records as JSON objects with
+`ts`, `level`, `logger`, `message`, `request_id`, `exc` (traceback), and the access fields
+(`method`, `path`, `route`, `status`, `duration_ms`, `bytes_in`, `bytes_out`, `client`,
+`user_agent`, `complete`, `failure`).
+
+Log output never blocks request handling: records are queued and a background thread
+writes them in batches (every 50 ms, warnings and errors at once). If the output stops
+draining, for example a stuck pipe to the container runtime, the gateway keeps serving,
+up to 10,000 waiting records are kept, and newer ones are dropped and counted in
+`kiro_gateway_log_records_dropped_total`. Logs go to stderr; rotation belongs to whatever
+collects them (`deploy/docker-compose.yml` caps the Docker log at 5 × 10 MB, journald
+rotates on its own).
+
+**Cost.** Measured on an Apple M4 with one worker, 32 concurrent clients, and the no-op
+`/api/hello` endpoint: 9,100–9,200 requests/s before this logging and metrics, with
+uvicorn's access log on (3.5 ms mean latency), and 8,600–8,800 requests/s with the access
+log, request ids, and metrics (3.6–3.7 ms); JSON lines cost a little more (8,300–8,550).
+Measured in-process, that is about 30 µs of CPU per request in total, against model turns
+that take seconds. With stderr piped into a reader that never reads, the old setup stopped
+answering once the pipe filled (the load test timed out and the server stayed
+unresponsive); this one served all 20,000 requests and counted 9,195 dropped lines.
+Process figures are read only when `/metrics` or `/v1/kiro/stats` is requested.
 
 **CI and packaging.** `.github/workflows/ci.yml` runs ruff and the test suite (fake ACP
 agent, no Kiro needed) on Linux and macOS for Python 3.11 to 3.13 and builds wheels with

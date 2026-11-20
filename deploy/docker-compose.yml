@@ -26,6 +26,13 @@ services:
       retries: 3
       start_period: 20s
     stop_grace_period: 30s
+    # Docker's json-file driver never rotates by default; cap the container log on disk
+    # (5 x 10 MB). `docker compose logs` still works.
+    logging:
+      driver: json-file
+      options:
+        max-size: "${KIRO_GW_LOG_MAX_SIZE:-10m}"
+        max-file: "${KIRO_GW_LOG_MAX_FILE:-5}"
 
 volumes:
   kiro-gw-home:

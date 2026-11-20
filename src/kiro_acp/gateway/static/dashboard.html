@@ -69,7 +69,7 @@
   .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 550; border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); white-space: nowrap; }
   .pill.busy { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
   .pill.ok, .pill.stop { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
-  .pill.error, .pill.refusal, .pill.cancelled { color: var(--bad); background: var(--bad-soft); border-color: transparent; }
+  .pill.error, .pill.refusal, .pill.cancelled, .pill.aborted { color: var(--bad); background: var(--bad-soft); border-color: transparent; }
   .pill.tool_calls, .pill.harness { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 
   .hist { display: grid; gap: 4px; }
@@ -134,6 +134,8 @@
     <div class="gauges" id="gauges"></div>
     <div class="settings" id="settingsLine"></div>
   </section>
+  <section class="panel"><div class="panel-head"><h2>System</h2><span class="hint" id="systemHint">gateway process and event loop</span></div><div class="gauges" id="system"></div></section>
+  <section class="panel"><div class="panel-head"><h2>HTTP requests</h2><span class="hint">by route and status; mean duration includes streaming</span></div><div id="http"></div></section>
   <section class="panel wide"><div class="panel-head"><h2>Live sessions</h2><span class="hint" id="sessionsHint"></span></div><div id="sessions"></div></section>
   <section class="panel"><div class="panel-head"><h2>Turns</h2><span class="hint">by mode, model and finish reason</span></div><div id="turns"></div></section>
   <section class="panel"><div class="panel-head"><h2>Latency</h2><span class="hint">turn duration, seconds</span></div><div id="latency"></div></section>
@@ -169,6 +171,8 @@
 
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
   const fmtDur = (s) => s == null ? "" : s < 60 ? s.toFixed(0) + "s" : s < 3600 ? (s/60).toFixed(1) + "m" : (s/3600).toFixed(1) + "h";
+  const fmtSecs = (s) => s == null ? "" : s < 1 ? Math.round(s * 1000) + " ms" : s.toFixed(2) + " s";
+  const fmtBytes = (b) => b == null ? "–" : b < 1048576 ? (b / 1024).toFixed(0) + " KB" : b < 1073741824 ? (b / 1048576).toFixed(1) + " MB" : (b / 1073741824).toFixed(2) + " GB";
   const fmtTime = (t) => new Date(t * 1000).toLocaleTimeString();
   const shortId = (id) => { const s = String(id); return s.length > 22 ? s.slice(0, 14) + "…" + s.slice(-6) : s; };
 
@@ -207,6 +211,29 @@
       kv("concurrency", s.max_concurrency), kv("session pool", `${s.max_sessions} × ${fmtDur(s.session_idle_ttl)} idle`),
       kv("workspace", s.workspace), ...(g.mcp_catalogue.length ? [kv("MCP catalogue", g.mcp_catalogue.join(", "))] : []),
     ].join("");
+
+    const y = d.system || {};
+    const lagClass = y.loop_lag_max_ms >= 100 ? "bad" : y.loop_lag_max_ms >= 20 ? "warn" : "";
+    const fdClass = y.open_fds != null && y.max_fds && y.open_fds > 0.8 * y.max_fds ? "warn" : "";
+    const memory = y.rss_bytes != null ? ["Memory (RSS)", fmtBytes(y.rss_bytes)] : ["Peak memory", fmtBytes(y.max_rss_bytes)];
+    const system = [
+      ["Uptime", fmtDur(y.uptime_seconds), ""], [memory[0], memory[1], ""],
+      ["CPU time", y.cpu_seconds == null ? "–" : y.cpu_seconds < 60 ? y.cpu_seconds.toFixed(1) + " s" : fmtDur(y.cpu_seconds), ""],
+      ["Open files", y.open_fds == null ? "–" : y.open_fds + (y.max_fds ? " / " + y.max_fds : ""), fdClass],
+      ["Loop lag (max 1m)", y.loop_lag_max_ms == null ? "–" : y.loop_lag_max_ms.toFixed(1) + " ms", lagClass],
+      ["Kiro processes", y.agent_processes ?? "–", ""],
+      ["Queued", y.queued_requests ?? 0, y.queued_requests ? "warn" : ""],
+      ["HTTP in flight", y.http_in_flight ?? 0, ""],
+    ];
+    $("system").innerHTML = system.map(([l, v, c]) => `<div class="gauge ${c}"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join("");
+    $("systemHint").textContent = y.pid ? `pid ${y.pid} · Python ${y.python || ""}${y.log_records_dropped ? " · " + y.log_records_dropped + " log records dropped" : ""}` : "";
+
+    const means = Object.fromEntries((m.http_latency || []).map(r => [r.method + " " + r.route, r.mean]));
+    const http = (m.http || []).slice().sort((a, b) => b.value - a.value).slice(0, 14);
+    $("http").innerHTML = table(["Method", "Route", "Status", "Count", "Route mean"],
+      http.map(r => [esc(r.method), `<span class="mono">${esc(r.route)}</span>`,
+        `<span class="pill ${Number(r.status) >= 500 ? "error" : Number(r.status) >= 400 ? "busy" : "ok"}">${esc(r.status)}</span>`,
+        r.value, fmtSecs(means[r.method + " " + r.route])]), [3, 4]);
 
     $("sessionsHint").textContent = d.sessions.length ? `${d.sessions.length} Kiro process${d.sessions.length === 1 ? "" : "es"} kept for reuse` : "";
     $("sessions").innerHTML = table(

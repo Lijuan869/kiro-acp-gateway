@@ -17,6 +17,7 @@ from kiro_acp.gateway.protocols.common import (
     new_id,
     now,
     read_json,
+    record_stream_error,
     sse,
     sse_response,
     stop_list,
@@ -140,10 +141,12 @@ async def stream_completion(
                     yield chunk(event.text)
                 elif isinstance(event, OutputDone):
                     if event.finish == "error":
+                        record_stream_error(backend, event.error or "Kiro turn failed")
                         yield sse(stream_error_body(event.error or "Kiro turn failed"))
                     else:
                         yield chunk("", finish_reason(event.finish))
     except GatewayError as error:
+        record_stream_error(backend, error)
         yield sse(
             {"error": {"message": error.message, "type": error.error_type, "code": error.code}}
         )

@@ -147,8 +147,23 @@ Useful endpoints:
 curl -s http://127.0.0.1:8000/health
 KEY=$(grep '^KIRO_GATEWAY_API_KEY=' ~/kiro-gw.env | cut -d= -f2-)
 curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8000/v1/kiro/stats
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8000/metrics
 docker compose logs -f
 ```
+
+## Logs and metrics
+
+- The gateway writes one access line per request plus turn start and end lines, all
+  tagged with the request id that clients get back in `X-Request-ID`. Follow one request
+  with `docker compose logs | grep '\[req_…\]'`.
+- `docker-compose.yml` caps the container log at `KIRO_GW_LOG_MAX_SIZE` ×
+  `KIRO_GW_LOG_MAX_FILE` (default 10m × 5). Docker's default json-file driver never
+  rotates, so before this the log grew until the disk was full. The new limit applies when
+  the container is recreated (`./deploy.sh` or `docker compose up -d`).
+- Set `KIRO_GATEWAY_LOG_FORMAT=json` in the env file when a log shipper (Loki, Vector,
+  Fluent Bit) reads the container log.
+- Prometheus can scrape `/metrics` with the gateway key as a bearer token. The
+  "Metrics" section of the top-level README lists the series.
 
 ## Networking and security
 

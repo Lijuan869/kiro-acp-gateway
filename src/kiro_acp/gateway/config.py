@@ -140,6 +140,15 @@ class Settings(BaseSettings):
     )
     cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
     log_level: str = "info"
+    log_format: Literal["text", "json"] = Field(
+        default="text",
+        description="Log line format on stderr: text, or json (one object per line, for log shippers)",
+    )
+    access_log: bool = Field(
+        default=True,
+        description="Log one line per HTTP request with status, duration, and bytes "
+        "(/health, /metrics and /v1/kiro/stats only at debug level unless they fail)",
+    )
     debug_acp: bool = Field(default=False, description="Log raw ACP traffic")
 
     # --- streaming -----------------------------------------------------------

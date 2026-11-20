@@ -35,6 +35,7 @@ from kiro_acp.gateway.protocols.common import (
     new_id,
     now,
     read_json,
+    record_stream_error,
     sse,
     sse_response,
     text_of_content,
@@ -705,6 +706,7 @@ async def stream_response(
                         for line in close_message():
                             yield line
                         if finish == "error":
+                            record_stream_error(backend, error or "Kiro turn failed")
                             response["status"] = "failed"
                             response["error"] = {
                                 "code": "server_error",
@@ -735,6 +737,7 @@ async def stream_response(
                                 response["id"], continued(conversation, text, calls), response
                             )
     except GatewayError as error:
+        record_stream_error(backend, error)
         response["status"] = "failed"
         response["error"] = {"code": error.code or "server_error", "message": error.message}
         yield emit("response.failed", response=response)

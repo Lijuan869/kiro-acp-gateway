@@ -4,6 +4,50 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Monitoring and logging, with no new dependencies. See the README sections "Metrics" and
+"Logging" for the series, the formats, and the measured cost.
+
+### Added
+
+- Request ids: every response carries `X-Request-ID` (the client's own when it is a plain
+  token, else a generated `req_…`), and every log line names the request it came from.
+- Access log (`KIRO_GATEWAY_ACCESS_LOG`, on by default): one line per request, written
+  when the response ends, with status, duration, bytes in and out, client, user agent, and
+  `incomplete` / `failed=` markers. It replaces uvicorn's access log; uvicorn's other lines
+  use the gateway format. Health checks, scrapes, and dashboard polling are logged at
+  `debug` level.
+- `KIRO_GATEWAY_LOG_FORMAT=json` / `--log-format json`: one JSON object per line.
+- Log records are written by a background thread in batches, so a slow or stuck log
+  consumer cannot stall requests. Records beyond 10,000 waiting are dropped and counted
+  (`kiro_gateway_log_records_dropped_total`).
+- A log line when a `kiro-cli` process starts (pid, engine, session, start time) and when
+  a turn ends (finish reason, duration, model, credits, error).
+- Metrics: HTTP requests, durations, and in-flight count by route template; queue wait,
+  queued requests, free turn slots, and configured concurrency; `kiro-cli` start time;
+  running `kiro-cli` processes; event-loop lag; build info; and the standard `process_*`
+  series (CPU, resident memory on Linux, open and maximum file descriptors, start time).
+- Dashboard: a System panel (uptime, memory, CPU, open files, loop lag, Kiro processes,
+  queued and in-flight requests) and an HTTP requests panel. `/v1/kiro/stats` has a new
+  `system` section and HTTP, queue-wait, and session-start figures.
+- `deploy/docker-compose.yml` caps the container log at 5 × 10 MB
+  (`KIRO_GW_LOG_MAX_SIZE`, `KIRO_GW_LOG_MAX_FILE`).
+
+### Fixed
+
+- `kiro_gateway_errors_total` missed every error delivered inside an SSE stream, which is
+  most errors from Claude Code and Codex. Streamed errors are now counted with the same
+  code and status as the non-streaming response, and 5xx stream errors are logged. 422
+  validation errors and unhandled 500s are counted too.
+- Turns that ended without a reply were missing from `kiro_gateway_turns_total`. They are
+  now recorded as `finish="aborted"` (the client disconnected, or shutdown) or
+  `finish="error"` (an exception).
+- Log lines from a pooled `kiro-cli` process's reader tasks (permission decisions,
+  stderr) no longer carry the id of the request that happened to start the process.
+  Permission lines now name the session.
+- A client-supplied `X-Request-ID` is no longer written to the log unchecked.
+
 ## [0.1.2] - 2026-09-18
 
 Fixes for the six findings of the 2026-09-18 compatibility review

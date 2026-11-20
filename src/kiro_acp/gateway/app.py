@@ -16,6 +16,7 @@ from kiro_acp import __version__
 from kiro_acp.acp.errors import ACPError
 from kiro_acp.gateway.backend import GatewayError, KiroBackend
 from kiro_acp.gateway.config import Settings
+from kiro_acp.gateway.middleware import ObservabilityMiddleware
 from kiro_acp.gateway.protocols import (
     anthropic,
     models,
@@ -73,6 +74,10 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
             allow_methods=["*"],
             allow_headers=["*"],
         )
+    # Added last so it wraps CORS too: every response gets X-Request-ID and is measured.
+    app.add_middleware(
+        ObservabilityMiddleware, metrics=backend.metrics, access_log=settings.access_log
+    )
 
     def get_backend() -> KiroBackend:
         return backend
@@ -271,6 +276,7 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
+        backend.metrics.record_error("validation_error", 422)
         return JSONResponse(
             error_body(request, str(error), "invalid_request_error", "validation_error"),
             status_code=422,
@@ -284,6 +290,7 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, error: Exception):
+        backend.metrics.record_error("internal_error", 500)
         LOG.exception("Unhandled error on %s %s", request.method, request.url.path)
         return JSONResponse(
             error_body(request, f"Internal error: {error}", "api_error", "internal_error"),

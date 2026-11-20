@@ -6,6 +6,7 @@ import base64
 import contextlib
 import copy
 import json
+import logging
 import re
 import time
 import uuid
@@ -15,9 +16,12 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
-from kiro_acp.gateway.backend import GatewayError, TurnOptions
+from kiro_acp.gateway.backend import GatewayError, KiroBackend, TurnOptions
 from kiro_acp.gateway.conversation import JSON, ImagePart, ToolCallPart, ToolDef
 from kiro_acp.gateway.inline_agent import InlineAgentError, parse_inline_agent
+from kiro_acp.gateway.logs import accept_request_id, current_request_id
+
+LOG = logging.getLogger("kiro_acp.gateway")
 
 _DATA_URL_RE = re.compile(
     r"^data:(?P<mime>[\w.+-]+/[\w.+-]+)?(?:;charset=[\w-]+)?;base64,(?P<data>.+)$", re.DOTALL
@@ -97,6 +101,21 @@ def stream_error_body(message: str) -> JSON:
     return {"error": {"message": message, "type": error_type, "code": code}}
 
 
+def record_stream_error(backend: KiroBackend, error: GatewayError | str) -> None:
+    """Account for an error delivered inside an SSE stream.
+
+    Once a stream has started the HTTP status is already 200, so the app's error handler
+    never sees these. Count and log them like the error response a non-streaming request
+    would have received, so ``kiro_gateway_errors_total`` covers streaming clients (Claude
+    Code, Codex) too. A failed Kiro turn (``str``) is classified the same way.
+    """
+    if isinstance(error, str):
+        error = GatewayError.from_kiro(error)
+    backend.metrics.record_error(error.code or "error", error.status)
+    if error.status >= 500:
+        LOG.error("stream -> %s %s: %s", error.status, error.code, error.message)
+
+
 def image_from_data_url(url: str, *, default_mime: str = "image/png") -> ImagePart:
     match = _DATA_URL_RE.match(url.strip())
     if not match:
@@ -161,7 +180,12 @@ def header_options(request: Request, opts: TurnOptions, body: JSON | None = None
     header_servers = request.headers.get("x-kiro-mcp-servers")
     if header_servers:
         opts.mcp_servers = [s.strip() for s in header_servers.split(",") if s.strip()]
-    opts.request_id = request.headers.get("x-request-id") or new_id("req_")
+    # The middleware's id, so access-log and turn lines of one request share it.
+    opts.request_id = (
+        current_request_id()
+        or accept_request_id(request.headers.get("x-request-id"))
+        or new_id("req_")
+    )
     return opts
 
 

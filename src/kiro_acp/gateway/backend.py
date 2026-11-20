@@ -7,10 +7,13 @@ import contextlib
 import json
 import logging
 import os
+import platform
 import re
 import shutil
+import sys
 import tempfile
 import time
+import weakref
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -46,6 +49,7 @@ from kiro_acp.gateway.conversation import JSON, Conversation, ToolCallPart, Tool
 from kiro_acp.gateway.harness_agent import agent_config, ensure_harness_agent
 from kiro_acp.gateway.inline_agent import custom_agent, harness_custom_agent
 from kiro_acp.gateway.limits import StreamLimiter
+from kiro_acp.gateway.logs import dropped_records
 from kiro_acp.gateway.mcp_servers import (
     McpServerError,
     discover,
@@ -59,6 +63,7 @@ from kiro_acp.gateway.mcp_turn import END, BridgeCall, PendingTurn
 from kiro_acp.gateway.metrics import Metrics
 from kiro_acp.gateway.prompting import assistant_message, render_prompt
 from kiro_acp.gateway.structured import strip_json_fences, validate_json_reply
+from kiro_acp.gateway.system import LoopLagMonitor, process_stats
 from kiro_acp.gateway.toolbridge.broker import BridgeSession, ToolBridgeBroker
 from kiro_acp.gateway.toolcalls import ToolCallParser
 from kiro_acp.gateway.turn import (
@@ -279,6 +284,10 @@ class KiroBackend:
         self._active: set[PooledSession] = set()
         self.bridge_broker: ToolBridgeBroker | None = None
         self.started = False
+        # Every agent this backend launched, to count live kiro-cli processes at scrape time.
+        self._agents: weakref.WeakSet[KiroAgent] = weakref.WeakSet()
+        self._waiting = 0  # requests waiting for a turn slot
+        self.loop_monitor = LoopLagMonitor(self.metrics.observe_loop_lag)
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -313,6 +322,7 @@ class KiroBackend:
             self.bridge_broker = ToolBridgeBroker()
             await self.bridge_broker.start()
         self.started = True
+        self.loop_monitor.start()
         self._reaper = asyncio.create_task(self._reap_idle(), name="kiro-session-reaper")
         if self.settings.warmup:
             self._warmup = asyncio.create_task(self._warm_up(), name="kiro-warmup")
@@ -330,6 +340,7 @@ class KiroBackend:
 
     async def stop(self) -> None:
         self.started = False
+        await self.loop_monitor.stop()
         active = list(self._active)
         if active:
             LOG.info("Shutting down: cancelling %d in-flight Kiro turn(s)", len(active))
@@ -490,7 +501,7 @@ class KiroBackend:
             verbose=1 if self.settings.debug_acp else 0,
         )
         cwd = workspace or self.settings.workspace
-        return KiroAgent(
+        agent = KiroAgent(
             options,
             cwd=cwd,
             handlers=self._handlers(permissions, cwd, extra_rules),
@@ -499,6 +510,12 @@ class KiroBackend:
             request_timeout=120.0,
             record_frames=self.settings.record_frames or None,
         )
+        self._agents.add(agent)
+        return agent
+
+    def agent_processes(self) -> int:
+        """kiro-cli processes this gateway started that are still running."""
+        return sum(1 for agent in list(self._agents) if agent.client.is_running)
 
     def _resolve_mcp_servers(self, opts: TurnOptions) -> None:
         """Turn request names/definitions into ACP ``mcpServers`` entries (agent mode only)."""
@@ -623,6 +640,7 @@ class KiroBackend:
             workspace=self.workspace_for(opts),
             extra_rules=extra_rules,
         )
+        launched = time.monotonic()
         try:
             await agent.start()
             session = await agent.new_session(
@@ -645,6 +663,16 @@ class KiroBackend:
             if bridge is not None:
                 self.bridge_broker.unregister(bridge)
             raise GatewayError.from_kiro(str(error)) from error
+        spawn_seconds = time.monotonic() - launched
+        self.metrics.observe_spawn(engine, spawn_seconds)
+        process = agent.client.process
+        LOG.info(
+            "Started kiro-cli pid=%s engine=%s session=%s in %.2fs",
+            process.pid if process else "?",
+            engine,
+            session.session_id,
+            spawn_seconds,
+        )
         return PooledSession(
             agent=agent,
             session=session,
@@ -811,6 +839,8 @@ class KiroBackend:
                 )
             else:
                 opts.agent = self.settings.agent
+        queued_at = time.monotonic()
+        self._waiting += 1
         try:
             await asyncio.wait_for(
                 self._turn_slots.acquire(),
@@ -824,6 +854,9 @@ class KiroBackend:
                 code="busy",
                 retry_after=max(1, int(self.settings.queue_timeout)),
             ) from error
+        finally:
+            self._waiting -= 1
+            self.metrics.observe_queue_wait(time.monotonic() - queued_at)
         try:
             exposed = conversation.tool_choice.exposed(conversation.tools)
             pooled, start, fresh = await self._acquire(conversation, opts, permissions, exposed)
@@ -886,6 +919,11 @@ class KiroBackend:
             error: str | None = None
             completed = False
             fingerprint: str | None = None
+            recorded = False
+            # Outcome for a turn that never reaches OutputDone: the consumer went away
+            # (client disconnect, shutdown) unless an exception says otherwise.
+            outcome = "aborted"
+            failure_text: str | None = None
             try:
                 self.audit.record(
                     session.session_id,
@@ -1024,7 +1062,8 @@ class KiroBackend:
                 fingerprint = None
                 if completed and error is None and finish in ("stop", "tool_calls"):
                     fingerprint = conversation.fingerprint_after(assistant_message(text, calls))
-                self._record_turn(opts, pooled, finish, kiro_meta, fresh)
+                self._record_turn(opts, pooled, finish, kiro_meta, fresh, error)
+                recorded = True
                 yield OutputDone(
                     finish=finish,
                     text=text,
@@ -1036,7 +1075,12 @@ class KiroBackend:
                     session_id=session.session_id,
                     stop_sequence=limiter.stop_sequence,
                 )
+            except Exception as failure:
+                outcome, failure_text = "error", str(failure)
+                raise
             finally:
+                if not recorded:
+                    self._record_turn(opts, pooled, outcome, kiro_meta, fresh, failure_text)
                 if not completed:
                     LOG.info(
                         "Turn %s ended early; cancelling Kiro session %s",
@@ -1158,6 +1202,9 @@ class KiroBackend:
         completed = False
         keep = False
         fingerprint: str | None = None
+        recorded = False
+        outcome = "aborted"  # see run(): the turn ended without reaching OutputDone
+        failure_text: str | None = None
         try:
             batch_deadline: float | None = None
             while True:
@@ -1270,7 +1317,8 @@ class KiroBackend:
             fingerprint = None
             if keep and finish in ("stop", "tool_calls"):
                 fingerprint = conversation.fingerprint_after(assistant_message(text, calls))
-            self._record_turn(opts, pooled, finish, kiro_meta, fresh)
+            self._record_turn(opts, pooled, finish, kiro_meta, fresh, error)
+            recorded = True
             yield OutputDone(
                 finish=finish,
                 text=text,
@@ -1283,7 +1331,12 @@ class KiroBackend:
             )
             if not keep:
                 pooled.pending = None
+        except Exception as failure:
+            outcome, failure_text = "error", str(failure)
+            raise
         finally:
+            if not recorded:
+                self._record_turn(opts, pooled, outcome, kiro_meta, fresh, failure_text)
             if pooled.pending is not None and not keep:
                 await pooled.pending.cancel("request ended")
                 pooled.pending = None
@@ -1493,16 +1546,35 @@ class KiroBackend:
             )
 
     def _record_turn(
-        self, opts: TurnOptions, pooled: PooledSession, finish: str, kiro_meta: JSON, fresh: bool
+        self,
+        opts: TurnOptions,
+        pooled: PooledSession,
+        finish: str,
+        kiro_meta: JSON,
+        fresh: bool,
+        error: str | None = None,
     ) -> None:
+        seconds = time.monotonic() - opts.started if opts.started else 0.0
+        credits = float(kiro_meta.get("credits", 0.0) or 0.0)
+        model = pooled.session.model_id or opts.model or "default"
         self.metrics.record_turn(
             mode="harness" if opts.emulate_tools else "agent",
             engine=pooled.agent.engine,
-            model=pooled.session.model_id or opts.model or "default",
+            model=model,
             finish=finish,
-            seconds=time.monotonic() - opts.started if opts.started else 0.0,
-            credits=float(kiro_meta.get("credits", 0.0) or 0.0),
+            seconds=seconds,
+            credits=credits,
             reused=not fresh,
+        )
+        LOG.info(
+            "turn %s finished: %s in %.2fs model=%s credits=%.4f session=%s%s",
+            opts.request_id,
+            finish,
+            seconds,
+            model,
+            credits,
+            pooled.session.session_id,
+            f" error={error.splitlines()[0][:300]!r}" if error else "",
         )
 
     def render_metrics(self) -> str:
@@ -1510,7 +1582,28 @@ class KiroBackend:
             active_turns=len(self._active),
             live_sessions=len(self._pool),
             models_cached=len(self._models),
+            queued_requests=self._waiting,
+            turn_slots_free=self._turn_slots._value,  # noqa: SLF001 - asyncio.Semaphore has no getter
+            max_concurrency=self.settings.max_concurrency,
+            agent_processes=self.agent_processes(),
+            process=process_stats(),
+            log_records_dropped=dropped_records(),
         )
+
+    def system_stats(self) -> JSON:
+        """Process, event-loop, and queue health for the dashboard."""
+        lag, lag_peak = self.metrics.loop_lag_summary()
+        return {
+            **process_stats(),
+            "python": platform.python_version(),
+            "platform": sys.platform,
+            "agent_processes": self.agent_processes(),
+            "queued_requests": self._waiting,
+            "http_in_flight": self.metrics.http_in_flight,
+            "loop_lag_ms": round(lag * 1000, 2),
+            "loop_lag_max_ms": round(lag_peak * 1000, 2),
+            "log_records_dropped": dropped_records(),
+        }
 
     def stats(self) -> JSON:
         """Everything the dashboard shows: counters, gauges, live sessions, recent activity."""
@@ -1558,6 +1651,7 @@ class KiroBackend:
                 "mcp_catalogue": sorted(self.mcp_catalogue),
             },
             "metrics": self.metrics.snapshot(),
+            "system": self.system_stats(),
             "sessions": sessions,
             "audit": self.audit.sessions()[-25:],
             "time": time.time(),

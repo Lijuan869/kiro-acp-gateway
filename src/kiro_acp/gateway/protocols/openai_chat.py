@@ -34,6 +34,7 @@ from kiro_acp.gateway.protocols.common import (
     new_id,
     now,
     read_json,
+    record_stream_error,
     sse,
     sse_response,
     stop_list,
@@ -414,6 +415,7 @@ async def stream_chat(
                         call_index += 1
                     case OutputDone(finish=finish, error=error, usage=usage, kiro=kiro):
                         if finish == "error":
+                            record_stream_error(backend, error or "Kiro turn failed")
                             yield sse(stream_error_body(error or "Kiro turn failed"))
                         else:
                             final: JSON = {}
@@ -430,10 +432,12 @@ async def stream_chat(
                             }
                             yield sse(payload)
     except GatewayError as error:
+        record_stream_error(backend, error)
         yield sse(
             {"error": {"message": error.message, "type": error.error_type, "code": error.code}}
         )
     except Exception as error:  # pragma: no cover - defensive
+        backend.metrics.record_error("internal_error", 500)
         LOG.exception("streaming chat failed")
         yield sse({"error": {"message": str(error), "type": "api_error", "code": "internal_error"}})
     yield "data: [DONE]\n\n"

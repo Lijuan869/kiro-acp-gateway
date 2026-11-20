@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -115,8 +116,15 @@ class ACPClient:
             ) from error
         except OSError as error:
             raise ACPProcessError(f"Failed to start agent {self.command!r}: {error}") from error
-        self._reader_task = asyncio.create_task(self._read_stdout(), name="acp-stdout")
-        self._stderr_task = asyncio.create_task(self._read_stderr(), name="acp-stderr")
+        # The readers outlive the call that started the agent (a pooled session serves many
+        # requests), so they start from an empty context rather than inheriting, say, the
+        # request id of whichever request spawned the process.
+        self._reader_task = asyncio.create_task(
+            self._read_stdout(), name="acp-stdout", context=contextvars.Context()
+        )
+        self._stderr_task = asyncio.create_task(
+            self._read_stderr(), name="acp-stderr", context=contextvars.Context()
+        )
 
     def _signal_group(self, sig: int) -> None:
         """Signal the agent's whole process group (falls back to the process itself)."""
@@ -270,8 +278,9 @@ class ACPClient:
         request = PermissionRequest.from_params(params, known)
         outcome, reason = await self.handlers.permissions.decide(request)
         LOG.info(
-            "permission %s: %s [%s] -> %s (%s)",
+            "permission %s (session %s): %s [%s] -> %s (%s)",
             request.tool_call_id,
+            session_id,
             request.title,
             request.kind.value,
             outcome.get("outcome", {}).get("optionId", outcome.get("outcome", {}).get("outcome")),
