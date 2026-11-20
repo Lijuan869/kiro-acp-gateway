@@ -6,28 +6,29 @@ Reproducible deployment record for the `kiro-gw` container.
 
 | Component | Version |
 |---|---|
-| kiro-acp-gateway | 0.1.2 |
+| kiro-acp-gateway | 0.1.3 |
 | Kiro CLI (inside image) | 3.5.0 (pinned) |
 | uv (build helper) | 0.13.9 (pinned) |
 | Python | 3.12.16 |
 | Docker | 29.4.1 |
 | Docker Compose | v5.1.3 |
 | Image | `kiro-acp-gateway:local` |
-| Image digest (2026-11-20 build) | `sha256:8cdfb5d530266f3acbe7502106626f44918df3f6f7f9e84da01c650ba8a55c8c` |
+| Image digest (2026-11-21 build) | `sha256:7370c29f5c86a1cdc526b46cd473de2f128479580b55b15fd63b17126d233770` |
+| Previous image (0.1.2, rollback) | `kiro-acp-gateway:before-20261121-0219` |
 
 The digest is informational. Rebuilding after a source or dependency change produces a new digest; tag or save the image before replacing it if you need rollback.
 
 ## Current deployment record
 
 - Host: Ubuntu 24.04, user `vm-user`, repo at `/home/vm-user/kiro-acp-gateway`
-- Container: `kiro-gw`
-- Ports: `127.0.0.1:8000` and `172.19.129.50:8000` (the IP is DHCP)
+- Container: `kiro-gw`, managed by Compose since 0.1.3 (the 0.1.2 container was a `docker run`)
+- Ports: `0.0.0.0:8000` (Compose default `KIRO_GW_BIND_IP`; the 0.1.2 container bound `127.0.0.1:8000` and `172.19.129.50:8000`)
 - Volume: `kiro-gw-home` -> `/home/kiro/.kiro`
 - Workspace: `/home/vm-user/kiro-workspace` -> `/workspace`
 - Env file: `/home/vm-user/kiro-gw.env` (600)
-- Restart policy: `unless-stopped`
+- Restart policy: `unless-stopped`; container log capped at 5 × 10 MB
 - Auth: `KIRO_API_KEY` (Kiro API key) + `KIRO_GATEWAY_API_KEY` (client key)
-- Permissions: `KIRO_GATEWAY_PERMISSIONS=deny`, harness permissions `allow-always`
+- Permissions: `KIRO_GATEWAY_PERMISSIONS=deny` plus `KIRO_GATEWAY_PERMISSION_RULES=allow:title=remote/web_search` (Claude Code's WebSearch), harness permissions `allow-always`
 
 Historical ad-hoc command (before Compose):
 
