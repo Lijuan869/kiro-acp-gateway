@@ -22,7 +22,7 @@ import pytest
 
 from kiro_acp.gateway.app import create_app
 from kiro_acp.gateway.conversation import Message, TextPart, ToolCallPart, canonical_message
-from kiro_acp.gateway.prompting import render_prompt
+from kiro_acp.gateway.prompting import render_message, render_prompt, side_request_view
 from kiro_acp.gateway.protocols import anthropic, openai_chat, openai_responses
 from tests.test_gateway import ANTHROPIC_HEADERS, FakeKiroBackend, make_settings, sse_events
 
@@ -444,7 +444,39 @@ def test_agent_summary_is_recognized_in_either_form() -> None:
         ],
     }
     assert kind(base[0], {"role": "assistant", "content": [call]}, forked) == "agent_summary"
+    # Forked before the subagent's first reply: the prompt joins the subagent's opening
+    # message, and Claude Code's notices follow it.
+    opening = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Count the files in data/."},
+            {"type": "text", "text": AGENT_SUMMARY},
+        ],
+    }
+    assert kind(opening, {"role": "system", "content": NOTICE}) == "agent_summary"
+    assert kind(*base, {"role": "user", "content": RECAP}, {"role": "system", "content": NOTICE})
     assert kind(*base, {"role": "user", "content": "Describe the bug in 3-5 words"}) is None
+
+
+def test_side_request_view_marks_only_the_prompt() -> None:
+    conversation = anthropic.build_conversation(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Count the files in data/."},
+                        {"type": "text", "text": AGENT_SUMMARY},
+                    ],
+                },
+                {"role": "system", "content": NOTICE},
+            ]
+        }
+    )
+    first, notice = (render_message(m) for m in side_request_view(conversation).messages)
+    assert first.startswith('<message role="user">\nCount the files in data/.\n\n<side_request>')
+    assert first.endswith(f"{AGENT_SUMMARY}\n</side_request>\n</message>")
+    assert notice == f'<message role="system">\n{NOTICE}\n</message>'
 
 
 async def test_agent_summary_closes_the_session_it_started(mcp_app: httpx.AsyncClient) -> None:
@@ -455,16 +487,22 @@ async def test_agent_summary_closes_the_session_it_started(mcp_app: httpx.AsyncC
         {"role": "user", "content": "echo: one"},
         {"role": "assistant", "content": [{"type": "text", "text": "one"}]},
     ]
-    for _ in range(2):
+    opening = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "echo: one"},
+            {"type": "text", "text": AGENT_SUMMARY},
+        ],
+    }
+    forms = (
+        [*history, {"role": "user", "content": AGENT_SUMMARY}],
+        [opening, {"role": "system", "content": NOTICE}],  # before the subagent's first reply
+    )
+    for messages in forms:
         label = await mcp_app.post(
             "/v1/messages",
             headers=ANTHROPIC_HEADERS,
-            json={
-                "model": "x",
-                "max_tokens": 100,
-                "tools": [READ],
-                "messages": [*history, {"role": "user", "content": AGENT_SUMMARY}],
-            },
+            json={"model": "x", "max_tokens": 100, "tools": [READ], "messages": messages},
         )
         assert label.status_code == 200, label.text
         assert label.json()["kiro"]["side_request"] == "agent_summary"

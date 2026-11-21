@@ -12,6 +12,7 @@ from kiro_acp.gateway.conversation import (
     Conversation,
     ImagePart,
     Message,
+    Part,
     TextPart,
     ToolCallPart,
     ToolResultPart,
@@ -40,20 +41,29 @@ SIDE_REQUEST_NOTE = (
 
 
 def side_request_view(conversation: Conversation) -> Conversation:
-    """The conversation as sent to Kiro for a side request: its last message marked as an
-    aside, so the model does not treat the request as part of the task."""
-    last = conversation.messages[-1]
-    marked = Message(
-        last.role,
-        [
-            TextPart(
-                f"<side_request>\n{SIDE_REQUEST_NOTE}\n\n{last.text().strip()}\n</side_request>"
-            ),
-            *[part for part in last.parts if not isinstance(part, TextPart)],
-        ],
-        name=last.name,
-    )
-    return dataclasses.replace(conversation, messages=[*conversation.messages[:-1], marked])
+    """The conversation as sent to Kiro for a side request: the prompt that makes it one
+    marked as an aside, so the model does not treat the request as part of the task. The
+    rest of that message (the subagent's opening text, tool results) and any notices after
+    it are sent as they are."""
+    found = conversation.side_request_at()
+    if found is None:
+        return conversation
+    index, position, _kind = found
+    message = conversation.messages[index]
+    parts = list(message.parts)
+
+    def has_text(chunk: list[Part]) -> bool:
+        return any(isinstance(p, TextPart) and p.text.strip() for p in chunk)
+
+    prompt = parts[position]
+    assert isinstance(prompt, TextPart)
+    before = "\n\n" if has_text(parts[:position]) else ""
+    after = "\n\n" if has_text(parts[position + 1 :]) else ""
+    marked = f"<side_request>\n{SIDE_REQUEST_NOTE}\n\n{prompt.text.strip()}\n</side_request>"
+    parts[position] = TextPart(f"{before}{marked}{after}")
+    messages = list(conversation.messages)
+    messages[index] = Message(message.role, parts, name=message.name)
+    return dataclasses.replace(conversation, messages=messages)
 
 
 def build_system_text(

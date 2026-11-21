@@ -150,18 +150,31 @@ class Conversation:
         history (Claude Code's session recap after the user has been away, its progress
         labels for a running subagent). Serving it like a normal turn would re-file the Kiro
         session under that throwaway exchange, so the next real message would not find it.
-        The prompt is a text block of the last message: a user message, or text sent beside
-        tool results (a fork taken just after the subagent's tools returned).
         """
-        if not self.messages or self.messages[-1].role not in ("user", "tool"):
+        found = self.side_request_at()
+        return found[2] if found else None
+
+    def side_request_at(self) -> tuple[int, int, str] | None:
+        """``(message index, part index, kind)`` of the prompt that makes this a side request.
+
+        The prompt is a text block of the last message that is not a system notice (Claude
+        Code appends its environment and deferred-tool notices after it): a user message,
+        possibly with other text blocks (a label forked before the subagent's first reply
+        rides in the subagent's opening message), or text sent beside tool results (a fork
+        taken just after the subagent's tools returned).
+        """
+        index = len(self.messages) - 1
+        while index >= 0 and self.messages[index].role == "system":
+            index -= 1
+        if index < 0 or self.messages[index].role not in ("user", "tool"):
             return None
-        for part in self.messages[-1].parts:
+        for position, part in enumerate(self.messages[index].parts):
             if not isinstance(part, TextPart):
                 continue
             text = part.text.lstrip()
             for kind, prefix in SIDE_REQUESTS:
                 if text.startswith(prefix):
-                    return kind
+                    return index, position, kind
         return None
 
     def affinity_key(self) -> str | None:

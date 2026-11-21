@@ -4,6 +4,19 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.6] - 2026-11-21
+
+### Fixed
+
+- 0.1.5 missed the progress label seen in a live run, because the request does not end
+  with the prompt. Claude Code appends its notices after it (`role: "system"` messages
+  with the environment and the deferred-tool list), and a label forked before the
+  subagent's first reply carries the prompt as an extra text block of the subagent's
+  opening message. The prompt is now looked for in the last message that is not a system
+  notice, and only that block is marked as the aside; the rest of the message and the
+  notices are sent as they are. On 0.1.5 that label ran as a normal turn (56 s, 1.05
+  credits) and its session stayed in the pool.
+
 ## [0.1.5] - 2026-11-21
 
 ### Fixed
