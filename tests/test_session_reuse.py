@@ -557,6 +557,57 @@ async def test_agent_summary_on_a_live_session_keeps_it(mcp_app: httpx.AsyncClie
     assert spawns(mcp_app) == 1
 
 
+async def test_agent_summaries_off_are_answered_without_kiro(workspace: Path, engine: str) -> None:
+    """KIRO_GATEWAY_AGENT_SUMMARIES=off: a progress label gets an empty reply at once and
+    never reaches Kiro; everything else does, the recap included."""
+    settings = make_settings(workspace, engine=engine, tool_mode="mcp", agent_summaries="off")
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gw", timeout=30
+        ) as http,
+    ):
+        http.app = app  # type: ignore[attr-defined]
+        opening = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "echo: one"},
+                {"type": "text", "text": AGENT_SUMMARY},
+            ],
+        }
+        body = {
+            "model": "x",
+            "max_tokens": 100,
+            "tools": [READ],
+            "messages": [opening, {"role": "system", "content": NOTICE}],
+        }
+        plain = await http.post("/v1/messages", headers=ANTHROPIC_HEADERS, json=body)
+        assert plain.status_code == 200, plain.text
+        assert plain.json()["content"] == [{"type": "text", "text": ""}]
+        assert plain.json()["kiro"] == {"side_request": "agent_summary", "answered_by": "gateway"}
+        streamed = await http.post(
+            "/v1/messages", headers=ANTHROPIC_HEADERS, json={**body, "stream": True}
+        )
+        names = [name for name, _ in sse_events(streamed.text)]
+        assert names[0] == "message_start" and "message_delta" in names, names
+        assert spawns(http) == 0
+        recap = await http.post(
+            "/v1/messages",
+            headers=ANTHROPIC_HEADERS,
+            json={
+                **body,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "ok"},
+                    {"role": "user", "content": RECAP},
+                ],
+            },
+        )
+        assert recap.json()["kiro"]["side_request"] == "recap"
+        assert spawns(http) == 1
+
+
 async def test_side_request_never_displaces_a_session(workspace: Path, engine: str) -> None:
     settings = make_settings(workspace, engine=engine)
     backend = FakeKiroBackend(settings)

@@ -869,6 +869,27 @@ class KiroBackend:
             raise GatewayError("Prompt too large", status=413, code="prompt_too_large")
         check_image_sizes(conversation, self.settings.max_image_bytes)
         opts.started = time.monotonic()
+        if (
+            self.settings.agent_summaries == "off"
+            and conversation.side_request() == "agent_summary"
+        ):
+            # Through Kiro every label starts a kiro-cli and replays the subagent's whole
+            # conversation. An empty reply shows no label; Claude Code asks again after the
+            # subagent's next step, and that is answered the same way.
+            LOG.info(
+                "Turn %s is a side request (agent_summary): answered without Kiro "
+                "(KIRO_GATEWAY_AGENT_SUMMARIES=off)",
+                opts.request_id,
+            )
+            yield OutputDone(
+                finish="stop",
+                text="",
+                thoughts="",
+                tool_calls=[],
+                usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                kiro={"side_request": "agent_summary", "answered_by": "gateway"},
+            )
+            return
         if opts.effort:
             try:
                 opts.effort = normalize_effort(opts.effort)

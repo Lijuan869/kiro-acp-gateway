@@ -751,8 +751,9 @@ model rereads the whole history. The gateway therefore tolerates what coding cli
   of the subagent's conversation. Its session is busy with the subagent, so the label
   starts its own `kiro-cli` and replays the conversation; that session is closed after the
   reply instead of filling the pool. Set `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES=1`
-  on the client to skip the labels and their cost. A side request never continues a turn
-  that is waiting for tool results.
+  on the client, or `KIRO_GATEWAY_AGENT_SUMMARIES=off` on the gateway, to skip the labels
+  and their cost. A side request never continues a turn that is waiting for tool
+  results.
 
 **Tool choice.** `tool_choice` is honoured in both tool modes: `none` hides the tools,
 a named function (OpenAI `{"type": "function", ...}`, Anthropic `{"type": "tool", ...}`)
@@ -922,6 +923,7 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_SESSION_MODE` | `affinity` | `affinity` or `stateless`. |
 | `KIRO_GATEWAY_SESSION_IDLE_TTL` | `600` | Seconds an idle session is kept. |
 | `KIRO_GATEWAY_MAX_SESSIONS` | `8` | Live Kiro processes kept for reuse. |
+| `KIRO_GATEWAY_AGENT_SUMMARIES` | `kiro` | Claude Code's 3-5 word progress label for a background subagent, every 30 s: `kiro` asks Kiro (each label starts a `kiro-cli` and replays the subagent's conversation; the session closes after the reply), `off` answers at once with an empty label and never calls Kiro. |
 | `KIRO_GATEWAY_DELETE_SESSIONS` | `true` | Delete Kiro's stored copy of gateway sessions when they are closed (v3). |
 | `KIRO_GATEWAY_MAX_CONCURRENCY` | `4` | Simultaneous turns. |
 | `KIRO_GATEWAY_QUEUE_TIMEOUT` | `60` | Seconds to wait for a free turn slot before answering `503` with `Retry-After`; `0` waits forever. |

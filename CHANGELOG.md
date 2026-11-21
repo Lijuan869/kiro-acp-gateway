@@ -4,6 +4,19 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.7] - 2026-11-21
+
+### Added
+
+- `KIRO_GATEWAY_AGENT_SUMMARIES` (`kiro` | `off`, default `kiro`). With `off` the gateway
+  answers Claude Code's subagent progress labels itself, at once, with an empty reply:
+  no label is shown, no `kiro-cli` starts, and no credits are spent. Claude Code asks again
+  after the subagent's next step and gets the same answer. Through Kiro, each label
+  replays the subagent's whole conversation; in one 26-minute subagent run the labels
+  cost 70.8 credits beside the subagent's own 127.6. Every other request, the session
+  recap included, still goes to Kiro. The client-side equivalent is
+  `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES=1`, which also stops the requests.
+
 ## [0.1.6] - 2026-11-21
 
 ### Fixed

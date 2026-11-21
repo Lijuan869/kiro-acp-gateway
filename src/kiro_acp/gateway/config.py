@@ -208,6 +208,15 @@ class Settings(BaseSettings):
     max_sessions: int = Field(
         default=8, ge=1, description="Max live Kiro processes kept for affinity"
     )
+    agent_summaries: Literal["kiro", "off"] = Field(
+        default="kiro",
+        description=(
+            "Claude Code's 3-5 word progress label for a background subagent (every 30 s): "
+            "'kiro' asks Kiro, which starts a kiro-cli and replays the subagent's "
+            "conversation each time (the session closes after the reply); 'off' answers "
+            "at once with an empty label, without Kiro"
+        ),
+    )
     delete_sessions: bool = Field(
         default=True,
         description="Delete Kiro's stored copy of gateway sessions when they are closed (v3 engine)",
