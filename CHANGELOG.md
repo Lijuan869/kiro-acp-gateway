@@ -4,6 +4,18 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - 2026-11-21
+
+### Fixed
+
+- Claude Code's session recap (sent after the user has been away a few minutes, then
+  discarded by the client) re-filed the Kiro session under the throwaway exchange, so the
+  user's next message started a new `kiro-cli` and replayed the conversation; observed
+  twice in 45 minutes of live use. The recap is now recognized
+  (`Conversation.side_request`), sent to Kiro marked as an aside, and the session stays
+  filed under the conversation it continued. A recap never displaces a live session, and
+  one that calls tools is closed instead of leaving a turn open.
+
 ## [0.1.3] - 2026-11-21
 
 ### Fixed (session reuse with Claude Code)

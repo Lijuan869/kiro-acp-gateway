@@ -741,6 +741,12 @@ model rereads the whole history. Three things coding clients do are therefore to
   sends `notifications/tools/list_changed` and Kiro re-reads the list, also while a call is
   pending. In `emulate` mode the tool schemas are part of the session's first prompt, so a
   changed set still starts a new session.
+- **One-off requests the client throws away.** Once the user has been away a few minutes,
+  Claude Code sends a recap request: the whole conversation plus a fixed "The user stepped
+  away and is coming back. Recap…" message, whose answer never enters its history. The
+  gateway recognizes it, sends it to Kiro marked as an aside, and keeps the session filed
+  under the conversation, so the next real message continues there. If no session was
+  live, the recap starts one, and the user's next message reuses it.
 
 **Tool choice.** `tool_choice` is honoured in both tool modes: `none` hides the tools,
 a named function (OpenAI `{"type": "function", ...}`, Anthropic `{"type": "tool", ...}`)

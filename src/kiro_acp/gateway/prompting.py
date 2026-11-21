@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 
@@ -30,6 +31,29 @@ TRANSCRIPT_NOTE = (
     "The conversation so far is reproduced here because this session has no memory of it. Treat it "
     "as the real conversation history."
 )
+
+SIDE_REQUEST_NOTE = (
+    "The client's interface asks this once and keeps both the question and your answer out of the "
+    "conversation. Answer it directly, without calling any tools. Afterwards the conversation "
+    "continues from before this request."
+)
+
+
+def side_request_view(conversation: Conversation) -> Conversation:
+    """The conversation as sent to Kiro for a side request: its last message marked as an
+    aside, so the model does not treat the request as part of the task."""
+    last = conversation.messages[-1]
+    marked = Message(
+        last.role,
+        [
+            TextPart(
+                f"<side_request>\n{SIDE_REQUEST_NOTE}\n\n{last.text().strip()}\n</side_request>"
+            ),
+            *[part for part in last.parts if not isinstance(part, TextPart)],
+        ],
+        name=last.name,
+    )
+    return dataclasses.replace(conversation, messages=[*conversation.messages[:-1], marked])
 
 
 def build_system_text(

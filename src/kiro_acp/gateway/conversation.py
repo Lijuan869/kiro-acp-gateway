@@ -13,6 +13,13 @@ JSON = dict[str, Any]
 # message; it lives in Conversation.system.
 Role = Literal["user", "assistant", "tool", "system"]
 
+# One-off requests a client builds on top of the conversation and then discards
+# (kind, start of the last user message). Claude Code 2.1.x sends its session recap
+# (``querySource: "away_summary"``, a fixed prompt) once the user has been away a while.
+SIDE_REQUESTS: tuple[tuple[str, str], ...] = (
+    ("recap", "The user stepped away and is coming back. Recap"),
+)
+
 
 @dataclass(slots=True)
 class TextPart:
@@ -125,6 +132,28 @@ class Conversation:
     metadata: JSON = field(default_factory=dict)
 
     # ------------------------------------------------------------------ fingerprints
+
+    def side_request(self) -> str | None:
+        """The kind of one-off request this is, if the client will throw the reply away.
+
+        Some clients fork the conversation for a single reply that never enters their
+        history (Claude Code's session recap after the user has been away). Serving it like a
+        normal turn would re-file the Kiro session under that throwaway exchange, so the next
+        real message would not find it.
+        """
+        if not self.messages or self.messages[-1].role != "user":
+            return None
+        text = self.messages[-1].text().lstrip()
+        for kind, prefix in SIDE_REQUESTS:
+            if text.startswith(prefix):
+                return kind
+        return None
+
+    def affinity_key(self) -> str | None:
+        """Fingerprint of the conversation up to its last assistant message (the key a pooled
+        session that already holds that history is filed under)."""
+        start = self.prefix_length_for_affinity()
+        return self.fingerprint(start) if start > 0 else None
 
     def prefix_length_for_affinity(self) -> int:
         """Index of the first message after the last assistant turn.

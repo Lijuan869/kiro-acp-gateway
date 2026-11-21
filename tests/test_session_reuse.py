@@ -336,6 +336,100 @@ async def test_agent_mode_reuse_delivers_the_notice(workspace: Path, engine: str
     assert "<operator_instructions>" not in prompts[1]  # only the new messages were sent
 
 
+# --------------------------------------------------------------------------- side requests
+
+RECAP = (
+    "The user stepped away and is coming back. Recap in under 40 words, 1-2 plain sentences, "
+    "no markdown. Lead with the overall goal and current task, then the one next action."
+)
+
+
+def test_recap_is_recognized_only_as_the_last_user_message() -> None:
+    def conversation(*messages: dict):
+        return anthropic.build_conversation({"messages": list(messages)})
+
+    base = ({"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"})
+    assert conversation(*base, {"role": "user", "content": RECAP}).side_request() == "recap"
+    assert (
+        conversation(*base, {"role": "user", "content": "please " + RECAP}).side_request() is None
+    )
+    assert (
+        conversation(
+            *base, {"role": "user", "content": RECAP}, {"role": "assistant", "content": "x"}
+        ).side_request()
+        is None
+    )
+    assert conversation(*base, {"role": "user", "content": "next"}).side_request() is None
+
+
+async def test_recap_leaves_the_session_with_the_conversation(mcp_app: httpx.AsyncClient) -> None:
+    """Claude Code's recap is served on the conversation's session and then discarded by
+    the client; the next real message must still find that session."""
+
+    async def ask(messages: list) -> dict:
+        response = await mcp_app.post(
+            "/v1/messages",
+            headers=ANTHROPIC_HEADERS,
+            json={"model": "x", "max_tokens": 100, "tools": [READ], "messages": messages},
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    history = [{"role": "user", "content": "echo: one"}]
+    first = await ask(history)
+    history.append({"role": "assistant", "content": first["content"]})
+    recap = await ask([*history, {"role": "user", "content": RECAP}])
+    assert recap["kiro"]["reused_session"] is True
+    assert recap["kiro"]["side_request"] == "recap"
+    after = await ask([*history, {"role": "user", "content": "history?"}])
+    assert after["kiro"]["reused_session"] is True
+    assert spawns(mcp_app) == 1
+    prompts = json.loads(after["content"][-1]["text"])
+    assert "<side_request>" in prompts[-1] and RECAP in prompts[-1]  # sent to Kiro as an aside
+
+
+async def test_recap_on_a_cold_conversation_warms_its_session(mcp_app: httpx.AsyncClient) -> None:
+    """With no live session (expired, gateway restarted) the recap starts one; the user's
+    next message then reuses it instead of starting another."""
+    history = [
+        {"role": "user", "content": "echo: one"},
+        {"role": "assistant", "content": [{"type": "text", "text": "one"}]},
+    ]
+    body = {"model": "x", "max_tokens": 100, "tools": [READ]}
+    recap = await mcp_app.post(
+        "/v1/messages",
+        headers=ANTHROPIC_HEADERS,
+        json={**body, "messages": [*history, {"role": "user", "content": RECAP}]},
+    )
+    assert recap.json()["kiro"]["reused_session"] is False
+    after = await mcp_app.post(
+        "/v1/messages",
+        headers=ANTHROPIC_HEADERS,
+        json={**body, "messages": [*history, {"role": "user", "content": "echo: two"}]},
+    )
+    assert after.json()["kiro"]["reused_session"] is True
+    assert spawns(mcp_app) == 1
+
+
+async def test_side_request_never_displaces_a_session(workspace: Path, engine: str) -> None:
+    settings = make_settings(workspace, engine=engine)
+    backend = FakeKiroBackend(settings)
+    await backend.start()
+    try:
+        from kiro_acp.gateway.backend import TurnOptions
+
+        opts = TurnOptions(model="claude-opus-4.8")
+        conversation_holder = await backend._spawn(opts, "allow-once")
+        side_session = await backend._spawn(opts, "allow-once")
+        await backend._release(conversation_holder, "key", keep=True)
+        await backend._release(side_session, "key", keep=True, displace=False)
+        assert backend._pool["key"] is conversation_holder
+        assert not side_session.agent.client.is_running
+        assert conversation_holder.agent.client.is_running
+    finally:
+        await backend.stop()
+
+
 # --------------------------------------------------------------------------- disconnects
 
 

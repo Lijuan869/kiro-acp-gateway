@@ -61,7 +61,7 @@ from kiro_acp.gateway.mcp_servers import (
 )
 from kiro_acp.gateway.mcp_turn import END, BridgeCall, PendingTurn
 from kiro_acp.gateway.metrics import Metrics
-from kiro_acp.gateway.prompting import assistant_message, render_prompt
+from kiro_acp.gateway.prompting import assistant_message, render_prompt, side_request_view
 from kiro_acp.gateway.structured import strip_json_fences, validate_json_reply
 from kiro_acp.gateway.system import LoopLagMonitor, process_stats
 from kiro_acp.gateway.toolbridge.broker import BridgeSession, ToolBridgeBroker
@@ -698,6 +698,8 @@ class KiroBackend:
         opts: TurnOptions,
         permissions: str,
         tools: list[ToolDef] | None = None,
+        *,
+        side: bool = False,
     ) -> tuple[PooledSession, int, bool]:
         """Return ``(pooled, start_index, fresh)``. ``tools`` are the ones the model may see
         (after ``tool_choice`` restrictions).
@@ -705,7 +707,8 @@ class KiroBackend:
         A session bridged over MCP takes a changed tool set in place (Claude Code loads
         deferred tools mid-conversation): the bridge announces the new list and Kiro re-reads
         it, even while a call is pending. An emulated-tools session needs the same set,
-        because its tool schemas are part of the prompt it was started with.
+        because its tool schemas are part of the prompt it was started with. A side request
+        (``side``) borrows the session as it is: it must not change the conversation's tools.
         """
         if tools is None:
             tools = conversation.tools
@@ -736,7 +739,9 @@ class KiroBackend:
                         del self._pool[key]
                     else:
                         pooled = None
-                if pooled is not None and await self._sync_tools(pooled, tools, signature):
+                if pooled is not None and (
+                    side or await self._sync_tools(pooled, tools, signature)
+                ):
                     LOG.debug(
                         "Reusing session %s for prefix %s", pooled.session.session_id, key[:12]
                     )
@@ -771,9 +776,24 @@ class KiroBackend:
         await self._release(pooled, None, keep=False)
         return False
 
-    async def _release(self, pooled: PooledSession, fingerprint: str | None, *, keep: bool) -> None:
+    async def _release(
+        self,
+        pooled: PooledSession,
+        fingerprint: str | None,
+        *,
+        keep: bool,
+        displace: bool = True,
+    ) -> None:
+        """Return a session to the pool under ``fingerprint``, or close it. With
+        ``displace=False`` a session already filed under that key wins and this one closes
+        (a side request must not push out the live conversation it was built on)."""
         pooled.busy = False
         pooled.last_used = time.monotonic()
+        if not displace and fingerprint is not None:
+            async with self._pool_lock:
+                occupant = self._pool.get(fingerprint)
+            if occupant is not None and occupant is not pooled:
+                keep = False
         if not keep or fingerprint is None or self.settings.session_mode != "affinity":
             await pooled.close(delete=self.settings.delete_sessions)
             if pooled.bridge is not None and self.bridge_broker is not None:
@@ -893,15 +913,25 @@ class KiroBackend:
             self.metrics.observe_queue_wait(time.monotonic() - queued_at)
         try:
             exposed = conversation.tool_choice.exposed(conversation.tools)
-            pooled, start, fresh = await self._acquire(conversation, opts, permissions, exposed)
+            side = conversation.side_request()
+            pooled, start, fresh = await self._acquire(
+                conversation, opts, permissions, exposed, side=side is not None
+            )
             self._active.add(pooled)
+            if side is not None:
+                LOG.info(
+                    "Turn %s is a side request (%s): the session stays filed under the "
+                    "conversation it was built on",
+                    opts.request_id,
+                    side,
+                )
             if (
                 opts.emulate_tools
                 and self.settings.tool_mode == "mcp"
                 and pooled.bridge is not None
             ):
                 async with contextlib.aclosing(
-                    self._run_mcp(conversation, opts, pooled, start, fresh)
+                    self._run_mcp(conversation, opts, pooled, start, fresh, side)
                 ) as mcp_events:
                     async for event in mcp_events:
                         yield event
@@ -919,7 +949,7 @@ class KiroBackend:
                 " (reused)" if not fresh else "",
             )
             blocks = render_prompt(
-                conversation,
+                side_request_view(conversation) if side else conversation,
                 start=start,
                 include_system=fresh,
                 emulate_tools=opts.emulate_tools,
@@ -1095,7 +1125,14 @@ class KiroBackend:
                     raise tool_choice_unsatisfied(conversation)
                 fingerprint = None
                 if completed and error is None and finish in ("stop", "tool_calls"):
-                    fingerprint = conversation.fingerprint_after(assistant_message(text, calls))
+                    if side is None:
+                        fingerprint = conversation.fingerprint_after(assistant_message(text, calls))
+                    elif finish == "stop" and not calls:
+                        # The client discards this exchange: file the session under the
+                        # conversation it continued, not under the throwaway reply.
+                        fingerprint = conversation.affinity_key()
+                if side is not None:
+                    kiro_meta["side_request"] = side
                 self._record_turn(opts, pooled, finish, kiro_meta, fresh, error)
                 recorded = True
                 yield OutputDone(
@@ -1129,7 +1166,10 @@ class KiroBackend:
                 else:
                     await self._finish(
                         self._release(
-                            pooled, fingerprint if error is None else None, keep=error is None
+                            pooled,
+                            fingerprint if error is None else None,
+                            keep=error is None,
+                            displace=side is None,
                         )
                     )
         finally:
@@ -1142,6 +1182,7 @@ class KiroBackend:
         pooled: PooledSession,
         start: int,
         fresh: bool,
+        side: str | None = None,
     ) -> AsyncIterator[OutputEvent]:
         """Harness turn with native tool calls through the MCP bridge."""
         session = pooled.session
@@ -1224,7 +1265,7 @@ class KiroBackend:
                     )
         else:
             blocks = render_prompt(
-                conversation,
+                side_request_view(conversation) if side else conversation,
                 start=start,
                 include_system=fresh,
                 emulate_tools=False,
@@ -1356,7 +1397,14 @@ class KiroBackend:
             else:
                 keep = True  # turn still open, waiting for tool results
             fingerprint = None
-            if keep and finish in ("stop", "tool_calls"):
+            if side is not None:
+                # The client throws this exchange away. Keep the session only for a plain
+                # answer, filed under the conversation it continued; a side request that
+                # called tools would leave a turn open that nobody will continue.
+                keep = keep and completed and finish == "stop" and not calls
+                fingerprint = conversation.affinity_key() if keep else None
+                kiro_meta["side_request"] = side
+            elif keep and finish in ("stop", "tool_calls"):
                 fingerprint = conversation.fingerprint_after(assistant_message(text, calls))
             self._record_turn(opts, pooled, finish, kiro_meta, fresh, error)
             recorded = True
@@ -1379,10 +1427,18 @@ class KiroBackend:
             if not recorded:
                 self._record_turn(opts, pooled, outcome, kiro_meta, fresh, failure_text)
             self._active.discard(pooled)
-            await self._finish(self._settle_mcp(pooled, keep, completed, fingerprint))
+            await self._finish(
+                self._settle_mcp(pooled, keep, completed, fingerprint, displace=side is None)
+            )
 
     async def _settle_mcp(
-        self, pooled: PooledSession, keep: bool, completed: bool, fingerprint: str | None
+        self,
+        pooled: PooledSession,
+        keep: bool,
+        completed: bool,
+        fingerprint: str | None,
+        *,
+        displace: bool = True,
     ) -> None:
         if pooled.pending is not None and not keep:
             await pooled.pending.cancel("request ended")
@@ -1390,7 +1446,7 @@ class KiroBackend:
         if not completed and not keep:
             await self._release(pooled, None, keep=False)
         else:
-            await self._release(pooled, fingerprint if keep else None, keep=keep)
+            await self._release(pooled, fingerprint if keep else None, keep=keep, displace=displace)
 
     async def _abandon(self, pooled: PooledSession) -> None:
         """Cancel the Kiro turn of a request that went away and close its session."""
