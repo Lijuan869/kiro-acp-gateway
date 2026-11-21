@@ -4,6 +4,8 @@
   reminders), which used to be merged into the system prompt and change the fingerprint;
 * tool inputs echoed back with defaults filled in (Edit gains ``"replace_all": false``);
 * the tool list growing mid-conversation (deferred tools loaded through ToolSearch);
+* one-off requests the client throws away: the session recap, and a progress label for a
+  background subagent every 30 s;
 * a client that disconnects mid-stream, whose session cleanup used to be cancelled.
 """
 
@@ -11,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import tempfile
 from pathlib import Path
 
@@ -411,6 +414,111 @@ async def test_recap_on_a_cold_conversation_warms_its_session(mcp_app: httpx.Asy
     assert spawns(mcp_app) == 1
 
 
+# Claude Code's progress label for a background subagent, every 30 s: a fork of the
+# subagent's conversation, or a note about it sent on its own.
+AGENT_SUMMARY = (
+    "Describe your most recent action in 3-5 words using present tense (-ing). Name the file "
+    'or function, not the branch. Do not use tools.\n\nGood: "Reading runAgent.ts"'
+)
+AGENT_LABEL = (
+    "Describe the agent's most recent action in 3-5 words using present tense (-ing). Name "
+    "the file or function, not the branch.\n\nPrevious: Running tests \u2014 keep it if the "
+    "agent is still doing that; otherwise say what is new.\n"
+)
+
+
+def test_agent_summary_is_recognized_in_either_form() -> None:
+    def kind(*messages: dict) -> str | None:
+        return anthropic.build_conversation({"messages": list(messages)}).side_request()
+
+    base = ({"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"})
+    assert kind(*base, {"role": "user", "content": AGENT_SUMMARY}) == "agent_summary"
+    assert kind({"role": "user", "content": AGENT_LABEL}) == "agent_summary"
+    # Taken just after the subagent's tools returned, the prompt rides beside the results.
+    call = {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}
+    forked = {
+        "role": "user",
+        "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "done"},
+            {"type": "text", "text": AGENT_SUMMARY},
+        ],
+    }
+    assert kind(base[0], {"role": "assistant", "content": [call]}, forked) == "agent_summary"
+    assert kind(*base, {"role": "user", "content": "Describe the bug in 3-5 words"}) is None
+
+
+async def test_agent_summary_closes_the_session_it_started(mcp_app: httpx.AsyncClient) -> None:
+    """Each label is a new fork, so a session started for one is never used again; kept, it
+    would only push real conversations out of the pool."""
+    backend = mcp_app.app.state.backend  # type: ignore[attr-defined]
+    history = [
+        {"role": "user", "content": "echo: one"},
+        {"role": "assistant", "content": [{"type": "text", "text": "one"}]},
+    ]
+    for _ in range(2):
+        label = await mcp_app.post(
+            "/v1/messages",
+            headers=ANTHROPIC_HEADERS,
+            json={
+                "model": "x",
+                "max_tokens": 100,
+                "tools": [READ],
+                "messages": [*history, {"role": "user", "content": AGENT_SUMMARY}],
+            },
+        )
+        assert label.status_code == 200, label.text
+        assert label.json()["kiro"]["side_request"] == "agent_summary"
+        assert label.json()["kiro"]["reused_session"] is False
+    assert spawns(mcp_app) == 2
+    assert backend._pool == {}  # noqa: SLF001
+    assert backend.agent_processes() == 0
+
+
+async def test_agent_summary_leaves_a_pending_tool_turn_alone(mcp_app: httpx.AsyncClient) -> None:
+    """A fork taken just after the subagent's tools returned carries the results the
+    subagent is about to send itself. Arriving first, it must not hand them to the
+    subagent's blocked Kiro turn."""
+    assistant, results = await first_tool_turn(mcp_app, [READ, BASH])
+    messages = [{"role": "user", "content": "mcp2"}, assistant]
+    forked = {**results, "content": [*results["content"], {"type": "text", "text": AGENT_SUMMARY}]}
+    body = {"model": "x", "max_tokens": 100, "tools": [READ, BASH]}
+    label = await mcp_app.post(
+        "/v1/messages", headers=ANTHROPIC_HEADERS, json={**body, "messages": [*messages, forked]}
+    )
+    assert label.json()["kiro"]["side_request"] == "agent_summary"
+    assert label.json()["kiro"]["reused_session"] is False
+    step = await mcp_app.post(
+        "/v1/messages", headers=ANTHROPIC_HEADERS, json={**body, "messages": [*messages, results]}
+    )
+    reply = step.json()
+    assert reply["kiro"]["reused_session"] is True
+    assert reply["content"][-1]["text"].startswith("results: out0 | out1")
+    assert spawns(mcp_app) == 2
+
+
+async def test_agent_summary_on_a_live_session_keeps_it(mcp_app: httpx.AsyncClient) -> None:
+    """A label that finds the conversation's own idle session borrows it like the recap
+    does; that session is not the label's to close."""
+
+    async def ask(messages: list) -> dict:
+        response = await mcp_app.post(
+            "/v1/messages",
+            headers=ANTHROPIC_HEADERS,
+            json={"model": "x", "max_tokens": 100, "tools": [READ], "messages": messages},
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    history = [{"role": "user", "content": "echo: one"}]
+    first = await ask(history)
+    history.append({"role": "assistant", "content": first["content"]})
+    label = await ask([*history, {"role": "user", "content": AGENT_SUMMARY}])
+    assert label["kiro"]["reused_session"] is True
+    after = await ask([*history, {"role": "user", "content": "echo: two"}])
+    assert after["kiro"]["reused_session"] is True
+    assert spawns(mcp_app) == 1
+
+
 async def test_side_request_never_displaces_a_session(workspace: Path, engine: str) -> None:
     settings = make_settings(workspace, engine=engine)
     backend = FakeKiroBackend(settings)
@@ -428,6 +536,38 @@ async def test_side_request_never_displaces_a_session(workspace: Path, engine: s
         assert conversation_holder.agent.client.is_running
     finally:
         await backend.stop()
+
+
+async def test_a_full_pool_closes_the_oldest_session_and_says_so(
+    workspace: Path, engine: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Closing a session to make room is logged, and its tool bridge is forgotten (it used
+    to stay registered with the broker for the gateway's lifetime)."""
+    caplog.set_level(logging.INFO, logger="kiro_acp.gateway.backend")
+    settings = make_settings(workspace, engine=engine, tool_mode="mcp", max_sessions=1)
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gw", timeout=30
+        ) as http,
+    ):
+        backend = app.state.backend
+        for prompt in ("echo: one", "echo: two"):
+            reply = await http.post(
+                "/v1/messages",
+                headers=ANTHROPIC_HEADERS,
+                json={
+                    "model": "x",
+                    "max_tokens": 50,
+                    "tools": [READ],
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
+            assert reply.status_code == 200, reply.text
+        assert backend.agent_processes() == 1
+        assert len(backend.bridge_broker._sessions) == 1  # noqa: SLF001
+    assert "more than 1 sessions are live (KIRO_GATEWAY_MAX_SESSIONS)" in caplog.text
 
 
 # --------------------------------------------------------------------------- disconnects

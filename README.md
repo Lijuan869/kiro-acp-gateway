@@ -725,7 +725,7 @@ history as a transcript. `KIRO_GATEWAY_SESSION_MODE=stateless` always starts fre
 Responses expose `kiro.session_id`, `kiro.reused_session`, `kiro.agent`, and `kiro.model`.
 
 A missed match is expensive in a long coding session: a new `kiro-cli` process, and the
-model rereads the whole history. Three things coding clients do are therefore tolerated:
+model rereads the whole history. The gateway therefore tolerates what coding clients do:
 
 - **System messages in the middle of the conversation.** Claude Code inserts
   `role: "system"` notices (working-directory updates, reminders) into `messages`, and
@@ -746,7 +746,13 @@ model rereads the whole history. Three things coding clients do are therefore to
   away and is coming back. Recap…" message, whose answer never enters its history. The
   gateway recognizes it, sends it to Kiro marked as an aside, and keeps the session filed
   under the conversation, so the next real message continues there. If no session was
-  live, the recap starts one, and the user's next message reuses it.
+  live, the recap starts one, and the user's next message reuses it. While a background
+  subagent runs, Claude Code also asks for a 3-5 word progress label every 30 s, on a fork
+  of the subagent's conversation. Its session is busy with the subagent, so the label
+  starts its own `kiro-cli` and replays the conversation; that session is closed after the
+  reply instead of filling the pool. Set `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES=1`
+  on the client to skip the labels and their cost. A side request never continues a turn
+  that is waiting for tool results.
 
 **Tool choice.** `tool_choice` is honoured in both tool modes: `none` hides the tools,
 a named function (OpenAI `{"type": "function", ...}`, Anthropic `{"type": "tool", ...}`)

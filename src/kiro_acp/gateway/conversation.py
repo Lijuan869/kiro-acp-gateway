@@ -14,11 +14,21 @@ JSON = dict[str, Any]
 Role = Literal["user", "assistant", "tool", "system"]
 
 # One-off requests a client builds on top of the conversation and then discards
-# (kind, start of the last user message). Claude Code 2.1.x sends its session recap
-# (``querySource: "away_summary"``, a fixed prompt) once the user has been away a while.
+# (kind, start of a text block in the last message). Claude Code 2.1.x sends its session
+# recap (``querySource: "away_summary"``, a fixed prompt) once the user has been away a
+# while, and every 30 s while a background subagent runs it asks for a 3-5 word progress
+# label (``querySource: "agent_summary"``): either a fork of the subagent's whole
+# conversation ("Describe your most recent action...") or a short note about it
+# ("Describe the agent's most recent action...").
 SIDE_REQUESTS: tuple[tuple[str, str], ...] = (
     ("recap", "The user stepped away and is coming back. Recap"),
+    ("agent_summary", "Describe your most recent action in 3-5 words"),
+    ("agent_summary", "Describe the agent's most recent action in 3-5 words"),
 )
+# Side requests whose own session is closed after the reply when one had to be started
+# for them: nothing continues that conversation (the subagent goes on in its own session,
+# and the next label is a new fork), so keeping it would only fill the session pool.
+DISPOSABLE_SIDE_REQUESTS = frozenset({"agent_summary"})
 
 
 @dataclass(slots=True)
@@ -137,16 +147,21 @@ class Conversation:
         """The kind of one-off request this is, if the client will throw the reply away.
 
         Some clients fork the conversation for a single reply that never enters their
-        history (Claude Code's session recap after the user has been away). Serving it like a
-        normal turn would re-file the Kiro session under that throwaway exchange, so the next
-        real message would not find it.
+        history (Claude Code's session recap after the user has been away, its progress
+        labels for a running subagent). Serving it like a normal turn would re-file the Kiro
+        session under that throwaway exchange, so the next real message would not find it.
+        The prompt is a text block of the last message: a user message, or text sent beside
+        tool results (a fork taken just after the subagent's tools returned).
         """
-        if not self.messages or self.messages[-1].role != "user":
+        if not self.messages or self.messages[-1].role not in ("user", "tool"):
             return None
-        text = self.messages[-1].text().lstrip()
-        for kind, prefix in SIDE_REQUESTS:
-            if text.startswith(prefix):
-                return kind
+        for part in self.messages[-1].parts:
+            if not isinstance(part, TextPart):
+                continue
+            text = part.text.lstrip()
+            for kind, prefix in SIDE_REQUESTS:
+                if text.startswith(prefix):
+                    return kind
         return None
 
     def affinity_key(self) -> str | None:

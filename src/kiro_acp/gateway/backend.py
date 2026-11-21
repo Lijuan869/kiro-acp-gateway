@@ -45,7 +45,13 @@ from kiro_acp.gateway.activity import render_completed, render_plan, render_star
 from kiro_acp.gateway.audit import AuditLedger
 from kiro_acp.gateway.codex import CodexCatalogCache
 from kiro_acp.gateway.config import Settings
-from kiro_acp.gateway.conversation import JSON, Conversation, ToolCallPart, ToolDef
+from kiro_acp.gateway.conversation import (
+    DISPOSABLE_SIDE_REQUESTS,
+    JSON,
+    Conversation,
+    ToolCallPart,
+    ToolDef,
+)
 from kiro_acp.gateway.harness_agent import agent_config, ensure_harness_agent
 from kiro_acp.gateway.inline_agent import custom_agent, harness_custom_agent
 from kiro_acp.gateway.limits import StreamLimiter
@@ -389,7 +395,7 @@ class KiroBackend:
                         expired.append(self._pool.pop(key))
             for pooled in expired:
                 LOG.info("Closing idle Kiro session %s", pooled.session.session_id)
-                await pooled.close(delete=self.settings.delete_sessions)
+                await self._close(pooled)
 
     # ------------------------------------------------------------------ models
 
@@ -708,7 +714,8 @@ class KiroBackend:
         deferred tools mid-conversation): the bridge announces the new list and Kiro re-reads
         it, even while a call is pending. An emulated-tools session needs the same set,
         because its tool schemas are part of the prompt it was started with. A side request
-        (``side``) borrows the session as it is: it must not change the conversation's tools.
+        (``side``) borrows the session as it is: it must not change the conversation's tools
+        or continue a turn that is waiting for tool results.
         """
         if tools is None:
             tools = conversation.tools
@@ -723,8 +730,13 @@ class KiroBackend:
                     if (
                         pooled is not None
                         and not pooled.busy
-                        # A session blocked on tool calls only continues with its own results.
-                        and (pooled.pending is None or bool(wanted & set(pooled.pending.awaiting)))
+                        # A session blocked on tool calls only continues with its own results,
+                        # and never for a side request: a fork that carries the results a
+                        # running subagent just got must not take over the subagent's turn.
+                        and (
+                            pooled.pending is None
+                            or (not side and bool(wanted & set(pooled.pending.awaiting)))
+                        )
                         and pooled.model == opts.model
                         and pooled.mode == opts.agent
                         and pooled.permissions == permissions
@@ -795,9 +807,7 @@ class KiroBackend:
             if occupant is not None and occupant is not pooled:
                 keep = False
         if not keep or fingerprint is None or self.settings.session_mode != "affinity":
-            await pooled.close(delete=self.settings.delete_sessions)
-            if pooled.bridge is not None and self.bridge_broker is not None:
-                self.bridge_broker.unregister(pooled.bridge)
+            await self._close(pooled)
             return
         pooled.fingerprint = fingerprint
         evicted: list[PooledSession] = []
@@ -806,15 +816,35 @@ class KiroBackend:
             if displaced is not None and displaced is not pooled:
                 # Two conversations with the same prefix (a client retry, a fan-out of the
                 # same prompt): keep one, close the other instead of orphaning its process.
+                LOG.info(
+                    "Closing Kiro session %s: session %s holds the same conversation",
+                    displaced.session.session_id,
+                    pooled.session.session_id,
+                )
                 evicted.append(displaced)
             self._pool[fingerprint] = pooled
             while len(self._pool) > self.settings.max_sessions:
                 oldest_key = min(self._pool, key=lambda k: self._pool[k].last_used)
                 if oldest_key == fingerprint and len(self._pool) == 1:
                     break
-                evicted.append(self._pool.pop(oldest_key))
+                oldest = self._pool.pop(oldest_key)
+                LOG.info(
+                    "Closing Kiro session %s (idle %.0fs%s): more than %d sessions are live "
+                    "(KIRO_GATEWAY_MAX_SESSIONS)",
+                    oldest.session.session_id,
+                    pooled.last_used - oldest.last_used,
+                    ", tool calls pending" if oldest.pending is not None else "",
+                    self.settings.max_sessions,
+                )
+                evicted.append(oldest)
         for item in evicted:
-            await item.close(delete=self.settings.delete_sessions)
+            await self._close(item)
+
+    async def _close(self, pooled: PooledSession) -> None:
+        """Stop a session's kiro-cli and drop its tool bridge from the broker."""
+        await pooled.close(delete=self.settings.delete_sessions)
+        if pooled.bridge is not None and self.bridge_broker is not None:
+            self.bridge_broker.unregister(pooled.bridge)
 
     # ------------------------------------------------------------------ turns
 
@@ -918,12 +948,16 @@ class KiroBackend:
                 conversation, opts, permissions, exposed, side=side is not None
             )
             self._active.add(pooled)
+            # A progress label on a session started just for it: nothing will continue there.
+            disposable = fresh and side in DISPOSABLE_SIDE_REQUESTS
             if side is not None:
                 LOG.info(
-                    "Turn %s is a side request (%s): the session stays filed under the "
-                    "conversation it was built on",
+                    "Turn %s is a side request (%s): %s",
                     opts.request_id,
                     side,
+                    "its session closes after the reply"
+                    if disposable
+                    else "the session stays filed under the conversation it was built on",
                 )
             if (
                 opts.emulate_tools
@@ -997,6 +1031,7 @@ class KiroBackend:
                     model=session.model_id,
                     workspace=pooled.workspace,
                     reused=not fresh,
+                    **({"side_request": side} if side else {}),
                 )
                 async with contextlib.aclosing(
                     self._turn_events(session, blocks, kiro_meta)
@@ -1127,9 +1162,10 @@ class KiroBackend:
                 if completed and error is None and finish in ("stop", "tool_calls"):
                     if side is None:
                         fingerprint = conversation.fingerprint_after(assistant_message(text, calls))
-                    elif finish == "stop" and not calls:
+                    elif finish == "stop" and not calls and not disposable:
                         # The client discards this exchange: file the session under the
-                        # conversation it continued, not under the throwaway reply.
+                        # conversation it continued, not under the throwaway reply. (A
+                        # disposable side request leaves no fingerprint: its session closes.)
                         fingerprint = conversation.affinity_key()
                 if side is not None:
                     kiro_meta["side_request"] = side
@@ -1210,6 +1246,7 @@ class KiroBackend:
             model=session.model_id,
             workspace=pooled.workspace,
             reused=not fresh,
+            **({"side_request": side} if side else {}),
         )
         LOG.info(
             "turn %s: harness(mcp) engine=%s agent=%s model=%s session=%s%s",
@@ -1400,8 +1437,15 @@ class KiroBackend:
             if side is not None:
                 # The client throws this exchange away. Keep the session only for a plain
                 # answer, filed under the conversation it continued; a side request that
-                # called tools would leave a turn open that nobody will continue.
-                keep = keep and completed and finish == "stop" and not calls
+                # called tools would leave a turn open that nobody will continue, and a
+                # disposable one (a progress label) on a session started just for it closes it.
+                keep = (
+                    keep
+                    and completed
+                    and finish == "stop"
+                    and not calls
+                    and not (fresh and side in DISPOSABLE_SIDE_REQUESTS)
+                )
                 fingerprint = conversation.affinity_key() if keep else None
                 kiro_meta["side_request"] = side
             elif keep and finish in ("stop", "tool_calls"):

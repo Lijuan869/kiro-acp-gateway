@@ -4,7 +4,36 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.5] - 2026-11-21
+
+### Fixed
+
+- While a background subagent runs, Claude Code asks for a 3-5 word progress label every
+  30 s (`querySource: "agent_summary"`): a fork of the subagent's whole conversation, or a
+  short note about it. Each one started a new `kiro-cli`, replayed the subagent's
+  conversation, and then stayed in the session pool, where it was never used again. In 26
+  minutes of live use with one subagent that was 35 extra sessions. They filled the pool
+  (`KIRO_GATEWAY_MAX_SESSIONS`, 8) and pushed out the main conversation's session while it
+  sat idle for ten minutes, so its next step started a new `kiro-cli` and replayed about
+  1 MB of conversation. The label is now recognized as a side request, and a session
+  started just for it is closed after the reply. Each label still costs a `kiro-cli` start
+  and a replay (0.4 credits at first, 3 per label once the subagent's conversation had
+  grown); `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES=1` on the client turns them off.
+- A side request no longer continues a Kiro turn that is waiting for tool results. A label
+  forked just after a subagent's tools returned carries the same results as the subagent's
+  next request; arriving first, it would have handed them to the subagent's blocked turn.
+- Side-request prompts are also found beside tool results and in any text block of the
+  last message, not only as a plain last user message.
+- A session closed for idleness or to make room in the pool left its MCP tool bridge
+  (with the client's tool list) registered with the broker until the gateway stopped.
+  Every way of closing a session now drops it.
+
+### Added
+
+- Audit `turn` records carry `side_request` for side requests.
+- A log line when a session is closed to make room in the pool
+  (`KIRO_GATEWAY_MAX_SESSIONS`) or because another session took over its conversation;
+  both used to be silent.
 
 ### Added (tests)
 
