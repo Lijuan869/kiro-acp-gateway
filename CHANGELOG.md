@@ -34,12 +34,13 @@ All notable changes to this project are recorded here. The format follows
   short note about it. Each one started a new `kiro-cli`, replayed the subagent's
   conversation, and then stayed in the session pool, where it was never used again. In 26
   minutes of live use with one subagent that was 35 extra sessions. They filled the pool
-  (`KIRO_GATEWAY_MAX_SESSIONS`, 8) and pushed out the main conversation's session while it
-  sat idle for ten minutes, so its next step started a new `kiro-cli` and replayed about
-  1 MB of conversation. The label is now recognized as a side request, and a session
-  started just for it is closed after the reply. Each label still costs a `kiro-cli` start
-  and a replay (0.4 credits at first, 3 per label once the subagent's conversation had
-  grown); `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES=1` on the client turns them off.
+  (`KIRO_GATEWAY_MAX_SESSIONS`, 8), so older sessions were closed to make room; the main
+  conversation's session, idle for ten minutes, was gone when the main thread went on,
+  and its next step started a new `kiro-cli` and replayed about 1 MB of conversation. The
+  label is now recognized as a side request, and a session started just for it is closed
+  after the reply. Each label still costs a `kiro-cli` start and a replay (0.4 credits at
+  first, 3 per label once the subagent's conversation had grown);
+  `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES=1` on the client turns them off.
 - A side request no longer continues a Kiro turn that is waiting for tool results. A label
   forked just after a subagent's tools returned carries the same results as the subagent's
   next request; arriving first, it would have handed them to the subagent's blocked turn.
