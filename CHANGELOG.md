@@ -17,6 +17,14 @@ All notable changes to this project are recorded here. The format follows
   notices are sent as they are. On 0.1.5 that label ran as a normal turn (56 s, 1.05
   credits) and its session stayed in the pool.
 
+### Added (tests)
+
+- `scripts/e2e_claude_code.py` scenario `bg_agent`: a background subagent runs three
+  30-second commands while Claude Code asks for its progress labels. It passes when the
+  labels were served as side requests, none of their sessions is still live afterwards,
+  and the main thread and the subagent each kept one session. Against 0.1.6 on the live
+  gateway: two labels (about 10 s and 0.2 credits each), both sessions closed.
+
 ## [0.1.5] - 2026-11-21
 
 ### Fixed

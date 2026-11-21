@@ -3,12 +3,13 @@
 
 Run it on a machine where a Claude Code wrapper (default ``claude-gw``) points at the
 gateway. Each scenario gets a scratch project under ``--out``; Claude Code runs headless
-(``-p``) or, for the option picker and the session recap, interactively in a
-pseudo-terminal rendered with ``pyte``. The recap scenario reports the terminal as
-unfocused (focus-out escape sequence) and waits the three minutes Claude Code lets pass
-before it asks for a recap. Afterwards the script checks the outcome, reads Claude Code's
-own transcript (API requests, tool calls, embedded system messages), and asks the gateway
-which Kiro sessions served the run (``/v1/kiro/sessions`` and their audit records).
+(``-p``) or, for the option picker, the session recap, and a background subagent,
+interactively in a pseudo-terminal rendered with ``pyte``. The recap scenario reports the
+terminal as unfocused (focus-out escape sequence) and waits the three minutes Claude Code
+lets pass before it asks for a recap. Afterwards the script checks the outcome, reads
+Claude Code's own transcript (API requests, tool calls, embedded system messages), and
+asks the gateway which Kiro sessions served the run (``/v1/kiro/sessions`` and their
+audit records) and which are still live (``/v1/kiro/stats``).
 
     python3 -m pip install --target /tmp/e2e-pylib pyte   # no venv needed
     PYTHONPATH=/tmp/e2e-pylib python3 scripts/e2e_claude_code.py \\
@@ -129,6 +130,20 @@ SCENARIOS = [
             ("What is 3000 + 1888? Reply with only the number.", "4888"),
             ("What is 6000 + 1234? Reply with only the number.", "7234"),
         ],
+    ),
+    Scenario(
+        "bg_agent",
+        "background subagent: its 30-second progress labels must not keep sessions "
+        "(about 4 minutes)",
+        "Use the Agent tool with run_in_background set to true to start a general-purpose "
+        "subagent with this exact task: 'Run these three Bash commands one at a time, each in "
+        "its own Bash tool call, waiting for each to finish before the next: "
+        '`python3 -c "import time; time.sleep(30); print(1)" && echo alpha`, then the same '
+        "with beta instead of alpha, then with gamma. Then report the three words that were "
+        "printed.' Do not run those commands yourself. When the subagent has reported, reply "
+        "with only the three words in upper case joined by hyphens.",
+        interactive=True,
+        timeout=480,
     ),
 ]
 
@@ -266,7 +281,7 @@ def run_interactive(run: Run, claude: str) -> None:
     term = Terminal([claude, "--dangerously-skip-permissions"], run.workdir)
     try:
         if start_ui(run, term):
-            (drive_recap if run.scenario.turns else drive_ask_user)(run, term)
+            DRIVERS[run.scenario.name](run, term)
     finally:
         term.close()
         run.exit_code = 0
@@ -357,6 +372,59 @@ def drive_recap(run: Run, term: Terminal) -> None:
         )
         return
     ask(run, term, "after_recap", *after)
+
+
+BG_REPLY = "ALPHA-BETA-GAMMA"
+
+
+def subagent_commands_done(run: Run) -> int:
+    with contextlib.suppress(Exception):
+        tool_uses = read_transcript(run)["tool_uses"]
+        return sum(1 for u in tool_uses if u["sub"] and u["name"] == "Bash" and u.get("result"))
+    return 0
+
+
+def drive_bg_agent(run: Run, term: Terminal) -> None:
+    """A background subagent works for about two minutes while Claude Code asks for its
+    progress label every 30 s. If the main thread has not replied a minute after the
+    subagent's last command returned, it is asked once whether the subagent is done."""
+    term.send(run.scenario.prompt, 1)
+    if not term.wait_for(lambda s: "run_in_background" in s, 10):
+        run.screens["typed"] = term.text()
+        run.error = "the prompt did not reach the input box"
+        return
+    term.send("\r", 1)
+    deadline = time.time() + run.scenario.timeout
+    commands_done_at: float | None = None
+    nudged = False
+    while time.time() < deadline and term.alive:
+        if term.wait_for(lambda s: BG_REPLY in s, 5):
+            break
+        if commands_done_at is None and subagent_commands_done(run) >= 3:
+            commands_done_at = time.time()
+        busy = "esc to interrupt" in term.text().lower()
+        if commands_done_at and not nudged and not busy and time.time() - commands_done_at > 60:
+            run.screens["before_nudge"] = term.text()
+            term.send(
+                "Has the background subagent reported? If so, reply with only the three "
+                "words in upper case joined by hyphens.",
+                1,
+            )
+            term.send("\r", 1)
+            nudged = True
+    term.pump(3)
+    run.screens["end"] = term.text()
+    if BG_REPLY in term.text():
+        run.result = BG_REPLY + (" (after a nudge)" if nudged else "")
+    else:
+        run.error = f"no {BG_REPLY} reply within {run.scenario.timeout}s"
+
+
+DRIVERS: dict[str, Callable[[Run, Terminal], None]] = {
+    "ask_user": drive_ask_user,
+    "recap": drive_recap,
+    "bg_agent": drive_bg_agent,
+}
 
 
 # --------------------------------------------------------------------------- transcript
@@ -521,6 +589,8 @@ class Gateway:
                         if r["kind"] == "permission"
                     ],
                     "turn_ends": [r.get("stop") for r in records if r["kind"] == "turn_end"],
+                    # One-off requests the gateway recognized (0.1.5 and later).
+                    "side_requests": [t["side_request"] for t in turns if t.get("side_request")],
                 }
             )
         turns = sum(s["turns"] for s in sessions)
@@ -530,6 +600,8 @@ class Gateway:
             "kiro_sessions_started": sum(1 for s in sessions if s["created_in_run"]),
             "turns": turns,
             "reused_turns": reused,
+            # Sessions the gateway still holds when the run is over.
+            "live_after": [s["session_id"][:8] for s in self.get("/v1/kiro/stats")["sessions"]],
         }
 
 
@@ -672,6 +744,36 @@ def evaluate(run: Run) -> None:
                 f"{g.get('reused_turns')} reused",
             )
         )
+    elif s.name == "bg_agent":
+        g = run.gateway
+        sessions = g.get("sessions", [])
+        # Sessions that served nothing but progress labels.
+        labels = [
+            x for x in sessions if x["side_requests"] and x["turns"] == len(x["side_requests"])
+        ]
+        label_requests = sum(x["side_requests"].count("agent_summary") for x in sessions)
+        work = [x for x in sessions if x["created_in_run"] and x not in labels]
+        commands = [u for u in uses(run, "Bash", sub=True) if u.get("result")]
+        checks.append(Check(f"reply is {BG_REPLY}", run.result.startswith(BG_REPLY), answer[:120]))
+        checks.append(
+            Check("the subagent ran its three commands", len(commands) >= 3, f"{len(commands)}")
+        )
+        checks.append(
+            Check(
+                "Claude Code asked for progress labels",
+                label_requests >= 1,
+                f"{label_requests} agent_summary requests",
+            )
+        )
+        left = [x["id"] for x in labels if x["id"] in g.get("live_after", [])]
+        checks.append(Check("no label session is left open", not left, ", ".join(left)))
+        checks.append(
+            Check(
+                "the main thread and the subagent kept their sessions",
+                len(work) >= 2 and all(x["reused_turns"] == x["turns"] - 1 for x in work),
+                "; ".join(f"{x['id']} turns={x['turns']} reused={x['reused_turns']}" for x in work),
+            )
+        )
 
 
 # --------------------------------------------------------------------------- main
@@ -776,6 +878,10 @@ def report(run: Run) -> None:
                     else "",
                     "Kiro tools: " + ",".join(s["kiro_tools"]) if s["kiro_tools"] else "",
                     "permissions: " + ",".join(s["permissions"]) if s["permissions"] else "",
+                    "side requests: " + ",".join(s["side_requests"])
+                    if s.get("side_requests")
+                    else "",
+                    "still live" if s["id"] in g.get("live_after", []) else "",
                 )
                 if x
             )
