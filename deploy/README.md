@@ -6,15 +6,16 @@ Reproducible deployment record for the `kiro-gw` container.
 
 | Component | Version |
 |---|---|
-| kiro-acp-gateway | 0.1.3 |
+| kiro-acp-gateway | 0.1.4 |
 | Kiro CLI (inside image) | 3.5.0 (pinned) |
 | uv (build helper) | 0.13.9 (pinned) |
 | Python | 3.12.16 |
 | Docker | 29.4.1 |
 | Docker Compose | v5.1.3 |
 | Image | `kiro-acp-gateway:local` |
-| Image digest (2026-11-21 build) | `sha256:7370c29f5c86a1cdc526b46cd473de2f128479580b55b15fd63b17126d233770` |
-| Previous image (0.1.2, rollback) | `kiro-acp-gateway:before-20261121-0219` |
+| Image digest (0.1.4, 2026-11-21 build) | `sha256:9c638c16ceaf2cf585f5863f98574aee165c5ba60424292ebb091bf2cde12f5b` |
+| Previous image (0.1.3, rollback) | `kiro-acp-gateway:before-20261121-1205` |
+| Older image (0.1.2) | `kiro-acp-gateway:before-20261121-0219` |
 
 The digest is informational. Rebuilding after a source or dependency change produces a new digest; tag or save the image before replacing it if you need rollback.
 
@@ -29,6 +30,9 @@ The digest is informational. Rebuilding after a source or dependency change prod
 - Restart policy: `unless-stopped`; container log capped at 5 × 10 MB
 - Auth: `KIRO_API_KEY` (Kiro API key) + `KIRO_GATEWAY_API_KEY` (client key)
 - Permissions: `KIRO_GATEWAY_PERMISSIONS=deny` plus `KIRO_GATEWAY_PERMISSION_RULES=allow:title=remote/web_search` (Claude Code's WebSearch), harness permissions `allow-always`
+- Sessions: `KIRO_GATEWAY_SESSION_IDLE_TTL=3600` keeps an idle Kiro session for an hour (default 600 s). With 10 minutes, a Claude Code user who stepped away for longer came back to a new kiro-cli and a replay of the whole conversation. An idle kiro-cli holds about 360 MB; at most `KIRO_GATEWAY_MAX_SESSIONS` (default 8) are kept, and the host has 64 GB.
+- Model catalogue: `KIRO_GATEWAY_MODELS_CACHE_TTL=86400` loads it at startup and refreshes it once a day (default 600 s). A refresh holds up the request that triggers it: with the default, about one Claude Code request every ten minutes waited 5.7–8.3 s.
+- Env file backups, one before each change: `~/kiro-gw.env.bak-20261121-0219` (before 0.1.3), `-1205` (before 0.1.4 and the model catalogue TTL), `-1247` (before the session TTL)
 
 Historical ad-hoc command (before Compose):
 

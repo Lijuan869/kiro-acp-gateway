@@ -905,6 +905,7 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_DEFAULT_MODEL` | Kiro default | Model for unknown or missing names. |
 | `KIRO_GATEWAY_MODEL_FALLBACK` | `true` | Fall back instead of returning 404. |
 | `KIRO_GATEWAY_MODEL_ALIASES` | empty | `pattern=model,...` extra aliases. |
+| `KIRO_GATEWAY_MODELS_CACHE_TTL` | `600` | Seconds the model catalogue is cached. A refresh starts a kiro-cli and holds up the request that triggered it for several seconds. |
 | `KIRO_GATEWAY_PERMISSIONS` | `deny` | Policy for Kiro's tool requests in agent mode. |
 | `KIRO_GATEWAY_PERMISSION_RULES` | empty | Ordered rules: `allow:kind=read,search`, `deny:tool=shell`, or Claude Code style `allow:Bash(git status*)`, `deny:Read(/etc/*)`, `allow:mcp__server__tool`. |
 | `KIRO_GATEWAY_HARNESS_PERMISSIONS` | `deny` | Policy while emulating client tools. |
