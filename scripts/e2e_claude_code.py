@@ -3,10 +3,12 @@
 
 Run it on a machine where a Claude Code wrapper (default ``claude-gw``) points at the
 gateway. Each scenario gets a scratch project under ``--out``; Claude Code runs headless
-(``-p``) or, for the option picker, interactively in a pseudo-terminal rendered with
-``pyte``. Afterwards the script checks the outcome, reads Claude Code's own transcript
-(API requests, tool calls, embedded system messages), and asks the gateway which Kiro
-sessions served the run (``/v1/kiro/sessions`` and their audit records).
+(``-p``) or, for the option picker and the session recap, interactively in a
+pseudo-terminal rendered with ``pyte``. The recap scenario reports the terminal as
+unfocused (focus-out escape sequence) and waits the three minutes Claude Code lets pass
+before it asks for a recap. Afterwards the script checks the outcome, reads Claude Code's
+own transcript (API requests, tool calls, embedded system messages), and asks the gateway
+which Kiro sessions served the run (``/v1/kiro/sessions`` and their audit records).
 
     python3 -m pip install --target /tmp/e2e-pylib pyte   # no venv needed
     PYTHONPATH=/tmp/e2e-pylib python3 scripts/e2e_claude_code.py \\
@@ -52,6 +54,9 @@ class Scenario:
     interactive: bool = False
     timeout: int = 900
     choose: int = 0  # interactive: which option to pick (1-based)
+    # recap: prompts typed one after another, each with a string its reply must contain;
+    # the last one is typed after the user has been away and Claude Code showed its recap
+    turns: list[tuple[str, str]] = field(default_factory=list)
 
 
 SCENARIOS = [
@@ -111,6 +116,19 @@ SCENARIOS = [
         interactive=True,
         choose=2,
         timeout=600,
+    ),
+    Scenario(
+        "recap",
+        "session recap: Claude Code's away summary must not cost the session (about 5 minutes)",
+        "",
+        interactive=True,
+        timeout=240,
+        turns=[
+            ("What is 1234 + 4321? Reply with only the number.", "5555"),
+            ("What is 2000 + 1717? Reply with only the number.", "3717"),
+            ("What is 3000 + 1888? Reply with only the number.", "4888"),
+            ("What is 6000 + 1234? Reply with only the number.", "7234"),
+        ],
     ),
 ]
 
@@ -190,6 +208,7 @@ class Terminal:
             env = {**os.environ, "TERM": "xterm-256color", "COLUMNS": str(cols), "LINES": str(rows)}
             os.execvpe(argv[0], argv, env)
         self.pid, self.fd, self.alive = pid, fd, True
+        self.focus_events = False  # Claude Code asked for focus reports (DECSET 1004)
 
     def pump(self, seconds: float) -> None:
         end = time.time() + seconds
@@ -204,6 +223,7 @@ class Terminal:
             if not data:
                 self.alive = False
                 break
+            self.focus_events = self.focus_events or b"\x1b[?1004h" in data
             self.stream.feed(data)
 
     def text(self) -> str:
@@ -239,50 +259,104 @@ class Terminal:
 
 
 OPTION_RE = re.compile(r"(?m)^\W*(?:❯\s*)?(\d)\.\s+(Apple|Banana|Cherry)\b")
+IDLE_RE = re.compile(r"for shortcuts|bypass permissions", re.IGNORECASE)
 
 
 def run_interactive(run: Run, claude: str) -> None:
     term = Terminal([claude, "--dangerously-skip-permissions"], run.workdir)
-    idle = re.compile(r"for shortcuts|bypass permissions", re.IGNORECASE)
     try:
-        ready = term.wait_for(
-            lambda s: "trust this folder" in s.lower() or bool(idle.search(s)), 60
-        )
-        run.screens["start"] = term.text()
-        if "trust this folder" in term.text().lower():
-            # The folder safety check defaults to "No, exit"; move to "Yes, I trust this folder".
-            term.send("\x1b[B", 0.5)
-            term.send("\r", 1)
-            ready = term.wait_for(lambda s: bool(idle.search(s)), 60)
-        if not ready or "didn't start" in term.text():
-            run.screens["not_ready"] = term.text()
-            run.error = "Claude Code UI did not come up"
-            return
-        term.send(run.scenario.prompt, 1)
-        if not term.wait_for(lambda s: "AskUserQuestion" in s, 10):
-            run.screens["typed"] = term.text()
-            run.error = "the prompt did not reach the input box"
-            return
-        term.send("\r", 1)
-        seen = term.wait_for(lambda s: len(set(OPTION_RE.findall(s))) >= 3, run.scenario.timeout)
-        run.screens["question"] = term.text()
-        if not seen:
-            run.error = "the option picker never appeared"
-            return
-        for _ in range(run.scenario.choose - 1):
-            term.send("\x1b[B", 0.5)
-        run.screens["choice"] = term.text()
-        term.send("\r", 2)
-        if re.search(r"(?i)submit answers|review your answers", term.text()):
-            run.screens["review"] = term.text()
-            term.send("\r", 2)
-        target = run.workdir / "fruit.txt"
-        term.wait_for(lambda s: target.exists(), run.scenario.timeout)
-        term.pump(15)  # let the final reply arrive
-        run.screens["end"] = term.text()
+        if start_ui(run, term):
+            (drive_recap if run.scenario.turns else drive_ask_user)(run, term)
     finally:
         term.close()
         run.exit_code = 0
+
+
+def start_ui(run: Run, term: Terminal) -> bool:
+    ready = term.wait_for(lambda s: "trust this folder" in s.lower() or bool(IDLE_RE.search(s)), 60)
+    run.screens["start"] = term.text()
+    if "trust this folder" in term.text().lower():
+        # The folder safety check defaults to "No, exit"; move to "Yes, I trust this folder".
+        term.send("\x1b[B", 0.5)
+        term.send("\r", 1)
+        ready = term.wait_for(lambda s: bool(IDLE_RE.search(s)), 60)
+    if not ready or "didn't start" in term.text():
+        run.screens["not_ready"] = term.text()
+        run.error = "Claude Code UI did not come up"
+        return False
+    return True
+
+
+def drive_ask_user(run: Run, term: Terminal) -> None:
+    term.send(run.scenario.prompt, 1)
+    if not term.wait_for(lambda s: "AskUserQuestion" in s, 10):
+        run.screens["typed"] = term.text()
+        run.error = "the prompt did not reach the input box"
+        return
+    term.send("\r", 1)
+    seen = term.wait_for(lambda s: len(set(OPTION_RE.findall(s))) >= 3, run.scenario.timeout)
+    run.screens["question"] = term.text()
+    if not seen:
+        run.error = "the option picker never appeared"
+        return
+    for _ in range(run.scenario.choose - 1):
+        term.send("\x1b[B", 0.5)
+    run.screens["choice"] = term.text()
+    term.send("\r", 2)
+    if re.search(r"(?i)submit answers|review your answers", term.text()):
+        run.screens["review"] = term.text()
+        term.send("\r", 2)
+    target = run.workdir / "fruit.txt"
+    term.wait_for(lambda s: target.exists(), run.scenario.timeout)
+    term.pump(15)  # let the final reply arrive
+    run.screens["end"] = term.text()
+
+
+def ask(run: Run, term: Terminal, step: str, prompt: str, reply: str) -> bool:
+    """Type one prompt; wait until its reply is on screen and the turn has ended."""
+    term.send(prompt, 1)
+    if not term.wait_for(lambda s: prompt[:24] in s, 10):
+        run.screens[step] = term.text()
+        run.error = f"{step}: the prompt did not reach the input box"
+        return False
+    term.send("\r", 1)
+    answer = re.compile(rf"(?<!\d){re.escape(reply)}(?!\d)")
+    seen = term.wait_for(lambda s: bool(answer.search(s)), run.scenario.timeout)
+    term.wait_for(lambda s: "esc to interrupt" not in s.lower(), 60)
+    term.pump(3)
+    run.screens[step] = term.text()
+    if not seen:
+        run.error = f"{step}: no reply {reply} within {run.scenario.timeout}s"
+        return False
+    run.result = f"{run.result} {reply}".strip()
+    return True
+
+
+RECAP_WAIT = 330  # Claude Code asks for the recap 3 minutes after the last reply
+
+
+def drive_recap(run: Run, term: Terminal) -> None:
+    """Three short turns, then the terminal loses focus. While the user is away Claude Code
+    asks for a recap: a one-off request on a fork of the conversation whose reply never
+    enters its history. Focus comes back and a fourth prompt follows; the gateway should
+    serve it from the session that held the first three turns."""
+    *before, after = run.scenario.turns
+    for number, (prompt, reply) in enumerate(before, 1):
+        if not ask(run, term, f"turn{number}", prompt, reply):
+            return
+    term.send("\x1b[O", 1)  # focus out: the user stepped away
+    away = time.time()
+    while time.time() - away < RECAP_WAIT and term.alive and not away_summaries(run):
+        term.pump(5)
+    run.screens["recap"] = term.text()
+    term.send("\x1b[I", 2)  # focus in: the user is back
+    if not away_summaries(run):
+        run.error = (
+            f"no recap within {RECAP_WAIT}s of the terminal losing focus "
+            f"(focus reports {'on' if term.focus_events else 'off'})"
+        )
+        return
+    ask(run, term, "after_recap", *after)
 
 
 # --------------------------------------------------------------------------- transcript
@@ -292,10 +366,29 @@ def config_dir() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude-gw")
 
 
-def read_transcript(run: Run) -> dict[str, Any]:
+def transcript_files(run: Run) -> list[Path]:
     project = re.sub(r"[^A-Za-z0-9-]", "-", str(run.workdir))
     root = config_dir() / "projects" / project
-    files = [p for p in root.rglob("*.jsonl") if p.stat().st_mtime >= run.started - 5]
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.rglob("*.jsonl") if p.stat().st_mtime >= run.started - 5)
+
+
+def away_summaries(run: Run) -> int:
+    """Recaps Claude Code has shown in this run (``system`` entries, subtype ``away_summary``)."""
+    count = 0
+    for path in transcript_files(run):
+        for raw in path.open(encoding="utf-8"):
+            if '"away_summary"' not in raw:
+                continue
+            with contextlib.suppress(json.JSONDecodeError):
+                entry = json.loads(raw)
+                count += entry.get("type") == "system" and entry.get("subtype") == "away_summary"
+    return count
+
+
+def read_transcript(run: Run) -> dict[str, Any]:
+    files = transcript_files(run)
     blobs: dict[str, Any] = {}
     requests, tool_uses, results, errors = [], [], {}, []
     final_text = ""
@@ -375,6 +468,7 @@ def read_transcript(run: Run) -> dict[str, Any]:
         "max_parallel": max(batches.values(), default=0),
         "api_errors": errors,
         "final_text": final_text,
+        "away_summaries": away_summaries(run),
     }
 
 
@@ -551,6 +645,33 @@ def evaluate(run: Run) -> None:
             )
         )
         checks.append(Check("fruit.txt is 'Banana'", content == "Banana", repr(content)))
+    elif s.name == "recap":
+        g = run.gateway
+        expected = [reply for _, reply in s.turns]
+        checks.append(
+            Check("every reply arrived", run.result.split() == expected, run.result or "-")
+        )
+        checks.append(
+            Check(
+                "Claude Code showed a recap",
+                t.get("away_summaries", 0) >= 1,
+                f"{t.get('away_summaries', 0)} away_summary entries",
+            )
+        )
+        # The recap is one more turn on the same session; before 0.1.4 it re-filed the
+        # session under its own throwaway exchange and the next prompt started a new one.
+        # (Tool calls the model makes on its own add turns; every one after the first
+        # should reuse the session.)
+        checks.append(
+            Check(
+                "one Kiro session served every turn, the recap included",
+                g.get("kiro_sessions_started") == 1
+                and g.get("turns", 0) > len(s.turns)
+                and g.get("reused_turns") == g.get("turns", 0) - 1,
+                f"{g.get('kiro_sessions_started')} sessions started, {g.get('turns')} turns, "
+                f"{g.get('reused_turns')} reused",
+            )
+        )
 
 
 # --------------------------------------------------------------------------- main

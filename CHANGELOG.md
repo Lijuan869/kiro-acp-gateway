@@ -4,6 +4,15 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added (tests)
+
+- `scripts/e2e_claude_code.py` scenario `recap`: three prompts, then the terminal is
+  reported unfocused until Claude Code asks for its recap (three minutes after the last
+  reply), then a fourth prompt. It passes when one Kiro session served every turn; against
+  0.1.4 on the live gateway one session served all six turns.
+
 ## [0.1.4] - 2026-11-21
 
 ### Fixed
